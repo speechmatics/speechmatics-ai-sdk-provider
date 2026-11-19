@@ -10,6 +10,7 @@ import {
   parseProviderOptions,
   postFormDataToApi,
   resolve,
+  safeValidateTypes,
   serializeModelOptions,
   WORKFLOW_DESERIALIZE,
   WORKFLOW_SERIALIZE,
@@ -27,12 +28,21 @@ import type { SpeechmaticsTranscriptionModelId } from './speechmatics-transcript
 import { buildTranscript } from './speechmatics-transcript';
 
 const DEFAULT_LANGUAGE = 'en';
-// Melia 1 and Oak 1 detect the language themselves and are selected with
-// `language: 'multi'`.
-const MULTILINGUAL_MODELS = new Set(['melia-1', 'oak-1']);
+// Melia 1 detects the language itself and is selected with `language: 'multi'`.
 const MULTILINGUAL_LANGUAGE = 'multi';
-const DEFAULT_POLLING_INTERVAL_MS = 2_000;
+const MULTILINGUAL_MODEL = 'melia-1';
+const DEFAULT_POLLING_INTERVAL_MS = 5_000;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1_000;
+
+// Job creation blocks for up to this long so short files finish in one request.
+// Kept well under the server's connection timeout: if the connection drops
+// before the response arrives we lose the job id and the job is orphaned.
+const MAX_CREATE_WAIT_SECONDS = 30;
+// Consecutive retryable errors (5xx, 429, network) tolerated while polling.
+// Retrying `doGenerate` would create, and bill, a second job.
+const MAX_TRANSIENT_POLL_ERRORS = 3;
+// A finished job's transcript can lag behind its status by a moment.
+const MAX_TRANSCRIPT_ATTEMPTS = 5;
 
 const FAILED_JOB_STATUSES = new Set(['rejected', 'deleted', 'expired']);
 
@@ -101,7 +111,7 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
       schema: speechmaticsTranscriptionModelOptionsSchema,
     });
 
-    const multilingual = MULTILINGUAL_MODELS.has(this.modelId);
+    const multilingual = this.modelId === MULTILINGUAL_MODEL;
 
     const transcriptionConfig: SpeechmaticsTranscriptionConfig = {
       language:
@@ -227,8 +237,18 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
       options.headers,
     );
 
-    const { value: created } = await postFormDataToApi({
-      url: this.config.url({ path: '/v2/jobs' }),
+    const createWaitSeconds = Math.max(
+      1,
+      Math.min(MAX_CREATE_WAIT_SECONDS, Math.floor(timeoutMs / 1_000)),
+    );
+    const {
+      value: created,
+      rawValue: createdRawValue,
+      responseHeaders: createdResponseHeaders,
+    } = await postFormDataToApi({
+      url: this.config.url({
+        path: `/v2/jobs?wait=${createWaitSeconds}&format=json-v2`,
+      }),
       headers,
       formData,
       failedResponseHandler: speechmaticsFailedResponseHandler,
@@ -239,31 +259,46 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
       fetch: this.config.fetch,
     });
 
-    const job = await this.waitForJob({
-      id: created.id,
-      headers,
-      abortSignal: options.abortSignal,
-      pollingIntervalMs,
-      timeoutMs,
-    });
+    // With `wait`, a job that finishes in time comes back with its transcript
+    // embedded. That is best-effort, so anything unusable falls through to polling.
+    let embedded: z.infer<typeof transcriptShape> | undefined;
+    if (created.status === 'done' && created['json-v2'] != null) {
+      const validated = await safeValidateTypes({
+        value: created['json-v2'],
+        schema: transcriptResponseSchema,
+      });
+      if (validated.success) {
+        embedded = validated.value;
+      }
+    }
 
-    const {
-      value: transcript,
-      rawValue,
-      responseHeaders,
-    } = await getFromApi({
-      url: this.config.url({
-        path: `/v2/jobs/${created.id}/transcript?format=json-v2`,
-      }),
-      headers,
-      failedResponseHandler: speechmaticsFailedResponseHandler,
-      successfulResponseHandler: createJsonResponseHandler(
-        transcriptResponseSchema,
-      ),
-      abortSignal: options.abortSignal,
-      fetch: this.config.fetch,
-      validateUrl: false,
-    });
+    let job: { duration?: number | null } | undefined;
+    let transcript: z.infer<typeof transcriptShape>;
+    let rawValue: unknown = createdRawValue;
+    let responseHeaders = createdResponseHeaders;
+
+    if (embedded != null) {
+      transcript = embedded;
+    } else {
+      job = await this.waitForJob({
+        id: created.id,
+        headers,
+        abortSignal: options.abortSignal,
+        pollingIntervalMs,
+        timeoutMs,
+      });
+
+      ({
+        value: transcript,
+        rawValue,
+        responseHeaders,
+      } = await this.fetchTranscript({
+        id: created.id,
+        headers,
+        abortSignal: options.abortSignal,
+        pollingIntervalMs,
+      }));
+    }
 
     const { text, segments, words, utterances, entities } = buildTranscript(
       transcript.results,
@@ -272,7 +307,8 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
     );
 
     const durationInSeconds =
-      job.duration ??
+      job?.duration ??
+      transcript.job?.duration ??
       transcript.results.reduce(
         (latest, item) => Math.max(latest, item.end_time),
         0,
@@ -306,6 +342,45 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
     };
   }
 
+  private async fetchTranscript({
+    id,
+    headers,
+    abortSignal,
+    pollingIntervalMs,
+  }: {
+    id: string;
+    headers: Record<string, string | undefined>;
+    abortSignal: AbortSignal | undefined;
+    pollingIntervalMs: number;
+  }) {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await getFromApi({
+          url: this.config.url({
+            path: `/v2/jobs/${id}/transcript?format=json-v2&wait=0`,
+          }),
+          headers,
+          failedResponseHandler: speechmaticsFailedResponseHandler,
+          successfulResponseHandler: createJsonResponseHandler(
+            transcriptResponseSchema,
+          ),
+          abortSignal,
+          fetch: this.config.fetch,
+          validateUrl: false,
+        });
+      } catch (error) {
+        // 404 means the transcript is not ready yet.
+        const retryable =
+          isTransientError(error) ||
+          (APICallError.isInstance(error) && error.statusCode === 404);
+        if (!retryable || attempt >= MAX_TRANSCRIPT_ATTEMPTS) {
+          throw error;
+        }
+        await delay(pollingIntervalMs, { abortSignal });
+      }
+    }
+  }
+
   private async waitForJob({
     id,
     headers,
@@ -319,21 +394,38 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
     pollingIntervalMs: number;
     timeoutMs: number;
   }) {
-    const url = this.config.url({ path: `/v2/jobs/${id}` });
+    // `wait=0` returns immediately. Without it the server applies a default
+    // wait that is unspecified and will grow, which would skew the interval.
+    const url = this.config.url({ path: `/v2/jobs/${id}?wait=0` });
     const deadline = Date.now() + timeoutMs;
+    let transientErrors = 0;
 
     while (true) {
-      const { value: response } = await getFromApi({
-        url,
-        headers,
-        failedResponseHandler: speechmaticsFailedResponseHandler,
-        successfulResponseHandler: createJsonResponseHandler(
-          jobResponseSchema,
-        ),
-        abortSignal,
-        fetch: this.config.fetch,
-        validateUrl: false,
-      });
+      let response;
+      try {
+        ({ value: response } = await getFromApi({
+          url,
+          headers,
+          failedResponseHandler: speechmaticsFailedResponseHandler,
+          successfulResponseHandler: createJsonResponseHandler(
+            jobResponseSchema,
+          ),
+          abortSignal,
+          fetch: this.config.fetch,
+          validateUrl: false,
+        }));
+        transientErrors = 0;
+      } catch (error) {
+        if (
+          !isTransientError(error) ||
+          ++transientErrors > MAX_TRANSIENT_POLL_ERRORS ||
+          Date.now() + pollingIntervalMs > deadline
+        ) {
+          throw error;
+        }
+        await delay(pollingIntervalMs, { abortSignal });
+        continue;
+      }
       const { job } = response;
 
       if (job.status === 'done') {
@@ -375,9 +467,18 @@ const createJobResponseSchema = lazySchema(() =>
   zodSchema(
     z.object({
       id: z.string(),
+      // Only present when `wait` was passed. Not the job lifecycle status: it
+      // reports whether the job finished within the wait.
+      status: z.string().nullish(),
+      // Validated separately so an unexpected shape cannot fail a job that has
+      // already been created.
+      'json-v2': z.unknown().nullish(),
     }),
   ),
 );
+
+const isTransientError = (error: unknown) =>
+  APICallError.isInstance(error) && error.isRetryable;
 
 const jobResponseSchema = lazySchema(() =>
   zodSchema(
@@ -398,41 +499,46 @@ const jobResponseSchema = lazySchema(() =>
   ),
 );
 
-const transcriptResponseSchema = lazySchema(() =>
-  zodSchema(
-    z.object({
-      metadata: z
+const transcriptShape = z.object({
+  job: z
+    .object({
+      duration: z.number().nullish(),
+    })
+    .nullish(),
+  metadata: z
+    .object({
+      transcription_config: z
         .object({
-          transcription_config: z
-            .object({
-              language: z.string().nullish(),
-            })
-            .nullish(),
-          language_pack_info: z
-            .object({
-              word_delimiter: z.string().nullish(),
-            })
-            .nullish(),
+          language: z.string().nullish(),
         })
         .nullish(),
-      results: z.array(
-        z.object({
-          type: z.string(),
-          start_time: z.number(),
-          end_time: z.number(),
-          is_eos: z.boolean().nullish(),
-          attaches_to: z.string().nullish(),
-          entity_class: z.string().nullish(),
-          alternatives: z
-            .array(
-              z.object({
-                content: z.string(),
-                speaker: z.string().nullish(),
-              }),
-            )
-            .nullish(),
-        }),
-      ),
+      language_pack_info: z
+        .object({
+          word_delimiter: z.string().nullish(),
+        })
+        .nullish(),
+    })
+    .nullish(),
+  results: z.array(
+    z.object({
+      type: z.string(),
+      start_time: z.number(),
+      end_time: z.number(),
+      is_eos: z.boolean().nullish(),
+      attaches_to: z.string().nullish(),
+      entity_class: z.string().nullish(),
+      alternatives: z
+        .array(
+          z.object({
+            content: z.string(),
+            speaker: z.string().nullish(),
+          }),
+        )
+        .nullish(),
     }),
   ),
+});
+
+const transcriptResponseSchema = lazySchema(() =>
+  zodSchema(transcriptShape),
 );

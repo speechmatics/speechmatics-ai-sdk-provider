@@ -51,13 +51,13 @@ Pass these under `providerOptions.speechmatics`:
 
 | Option | Description |
 | --- | --- |
-| `language` | Language code of the audio. Defaults to `en`, or `multi` for `melia-1` and `oak-1`. |
+| `language` | Language code of the audio. Defaults to `en`, or `multi` for `melia-1`. |
 | `domain` | Specialised model for a field, e.g. `finance` or `medical`. |
 | `outputLocale` | Locale for the transcript output, e.g. `en-GB`. |
 | `diarization` | `none`, `speaker` or `channel`. Speaker turns are returned in `providerMetadata.speechmatics.utterances`. |
 | `additionalVocab` | Custom words, with optional `soundsLike` pronunciations. |
 | `enableEntities` | Include entities such as dates and numbers. They are returned in `providerMetadata.speechmatics.entities`. |
-| `pollingIntervalMs` | How often to check job status. Defaults to 2000. |
+| `pollingIntervalMs` | How often to check job status. Defaults to 5000. |
 | `timeoutMs` | How long to wait for the job. Defaults to 15 minutes. |
 
 ## Models
@@ -69,11 +69,12 @@ Pass the model to `speechmatics.transcription(...)`. The default is `enhanced`.
 | `enhanced` | Highest accuracy on single-language audio. |
 | `standard` | Lower latency and higher throughput. |
 | `melia-1` | Audio with more than one language. |
-| `oak-1` | Multilingual healthcare audio. |
 
-`melia-1` and `oak-1` do not support custom vocabulary, and accept entities only
-with Entity Detection, which this package does not expose yet. Passing
-`additionalVocab` or `enableEntities` with them returns a warning.
+`melia-1` does not support custom vocabulary, and accepts entities only with
+Entity Detection, which this package does not expose yet. Passing
+`additionalVocab` or `enableEntities` with it returns a warning.
+
+Any other model name throws `NoSuchModelError`.
 
 ## Extra results
 

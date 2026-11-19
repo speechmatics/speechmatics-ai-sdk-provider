@@ -11,7 +11,7 @@ export const speechmaticsTranscriptionModelOptionsSchema = lazySchema(() =>
     z.object({
       /**
        * Language of the audio as a Speechmatics language code, e.g. `en`.
-       * Defaults to `en`, or `multi` for the `melia-1` and `oak-1` models.
+       * Defaults to `en`, or `multi` for the `melia-1` model.
        */
       language: z.string().optional(),
 
@@ -51,7 +51,7 @@ export const speechmaticsTranscriptionModelOptionsSchema = lazySchema(() =>
 
       /**
        * How often to check whether the job has finished, in milliseconds.
-       * Defaults to 2000.
+       * Defaults to 5000.
        */
       pollingIntervalMs: z.number().int().positive().optional(),
 

@@ -11,7 +11,10 @@ import {
   type Resolvable,
 } from '@ai-sdk/provider-utils';
 import { SpeechmaticsTranscriptionModel } from './speechmatics-transcription-model';
-import type { SpeechmaticsTranscriptionModelId } from './speechmatics-transcription-options';
+import {
+  SPEECHMATICS_BATCH_MODEL_IDS,
+  type SpeechmaticsTranscriptionModelId,
+} from './speechmatics-transcription-options';
 import { VERSION } from './version';
 
 const DEFAULT_BASE_URL = 'https://asr.api.speechmatics.com';
@@ -82,13 +85,24 @@ export function createSpeechmatics(
 
   const createTranscriptionModel = (
     modelId: SpeechmaticsTranscriptionModelId = 'enhanced',
-  ) =>
-    new SpeechmaticsTranscriptionModel(modelId, {
+  ) => {
+    // The type already restricts this, but callers without type checking can
+    // pass anything.
+    if (!(SPEECHMATICS_BATCH_MODEL_IDS as readonly string[]).includes(modelId)) {
+      throw new NoSuchModelError({
+        modelId,
+        modelType: 'transcriptionModel',
+        message: `Speechmatics batch transcription supports these models: ${SPEECHMATICS_BATCH_MODEL_IDS.join(', ')}. Got "${modelId}".`,
+      });
+    }
+
+    return new SpeechmaticsTranscriptionModel(modelId, {
       provider: 'speechmatics.transcription',
       url: ({ path }) => `${baseURL}${path}`,
       headers: getHeaders,
       fetch: options.fetch,
     });
+  };
 
   const provider = {
     specificationVersion: 'v4' as const,
