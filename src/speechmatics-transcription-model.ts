@@ -1,0 +1,438 @@
+import { APICallError } from '@ai-sdk/provider';
+import type { SharedV4Warning, TranscriptionModelV4 } from '@ai-sdk/provider';
+import {
+  combineHeaders,
+  convertBase64ToUint8Array,
+  createJsonResponseHandler,
+  delay,
+  getFromApi,
+  lazySchema,
+  parseProviderOptions,
+  postFormDataToApi,
+  resolve,
+  serializeModelOptions,
+  WORKFLOW_DESERIALIZE,
+  WORKFLOW_SERIALIZE,
+  zodSchema,
+} from '@ai-sdk/provider-utils';
+import { z } from 'zod/v4';
+import type {
+  SpeechmaticsJobConfig,
+  SpeechmaticsTranscriptionConfig,
+} from './speechmatics-api-types';
+import type { SpeechmaticsConfig } from './speechmatics-config';
+import { speechmaticsFailedResponseHandler } from './speechmatics-error';
+import { speechmaticsTranscriptionModelOptionsSchema } from './speechmatics-transcription-model-options';
+import type { SpeechmaticsTranscriptionModelId } from './speechmatics-transcription-options';
+import { buildTranscript } from './speechmatics-transcript';
+
+const DEFAULT_LANGUAGE = 'en';
+// Melia 1 and Oak 1 detect the language themselves and are selected with
+// `language: 'multi'`.
+const MULTILINGUAL_MODELS = new Set(['melia-1', 'oak-1']);
+const MULTILINGUAL_LANGUAGE = 'multi';
+const DEFAULT_POLLING_INTERVAL_MS = 2_000;
+const DEFAULT_TIMEOUT_MS = 15 * 60 * 1_000;
+
+const FAILED_JOB_STATUSES = new Set(['rejected', 'deleted', 'expired']);
+
+const FILE_EXTENSIONS: Record<string, string> = {
+  'audio/mpeg': 'mp3',
+  'audio/mp3': 'mp3',
+  'audio/wav': 'wav',
+  'audio/wave': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/flac': 'flac',
+  'audio/ogg': 'ogg',
+  'audio/mp4': 'm4a',
+  'audio/x-m4a': 'm4a',
+  'audio/aac': 'aac',
+  'audio/webm': 'webm',
+  'audio/amr': 'amr',
+  'video/mp4': 'mp4',
+};
+
+interface SpeechmaticsTranscriptionModelConfig extends SpeechmaticsConfig {
+  _internal?: {
+    currentDate?: () => Date;
+  };
+}
+
+type GenerateOptions = Parameters<TranscriptionModelV4['doGenerate']>[0];
+type GenerateResult = Awaited<ReturnType<TranscriptionModelV4['doGenerate']>>;
+type GenerateFromUrlOptions = Parameters<
+  NonNullable<TranscriptionModelV4['doGenerateFromUrl']>
+>[0];
+
+export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
+  readonly specificationVersion = 'v4';
+
+  get provider(): string {
+    return this.config.provider;
+  }
+
+  static [WORKFLOW_SERIALIZE](model: SpeechmaticsTranscriptionModel) {
+    return serializeModelOptions({
+      modelId: model.modelId,
+      config: model.config,
+    });
+  }
+
+  static [WORKFLOW_DESERIALIZE](options: {
+    modelId: SpeechmaticsTranscriptionModelId;
+    config: SpeechmaticsTranscriptionModelConfig;
+  }) {
+    return new SpeechmaticsTranscriptionModel(options.modelId, options.config);
+  }
+
+  constructor(
+    readonly modelId: SpeechmaticsTranscriptionModelId,
+    private readonly config: SpeechmaticsTranscriptionModelConfig,
+  ) {}
+
+  private async getArgs({
+    providerOptions,
+  }: Pick<GenerateOptions, 'providerOptions'>) {
+    const warnings: SharedV4Warning[] = [];
+
+    const options = await parseProviderOptions({
+      provider: 'speechmatics',
+      providerOptions,
+      schema: speechmaticsTranscriptionModelOptionsSchema,
+    });
+
+    const multilingual = MULTILINGUAL_MODELS.has(this.modelId);
+
+    const transcriptionConfig: SpeechmaticsTranscriptionConfig = {
+      language:
+        options?.language ??
+        (multilingual ? MULTILINGUAL_LANGUAGE : DEFAULT_LANGUAGE),
+      model: this.modelId,
+    };
+
+    if (options?.domain != null) {
+      transcriptionConfig.domain = options.domain;
+    }
+    if (options?.outputLocale != null) {
+      transcriptionConfig.output_locale = options.outputLocale;
+    }
+    if (options?.diarization != null) {
+      transcriptionConfig.diarization = options.diarization;
+    }
+    if (options?.additionalVocab != null) {
+      transcriptionConfig.additional_vocab = options.additionalVocab.map(
+        entry => ({
+          content: entry.content,
+          ...(entry.soundsLike != null
+            ? { sounds_like: entry.soundsLike }
+            : {}),
+        }),
+      );
+    }
+    if (options?.enableEntities != null) {
+      transcriptionConfig.enable_entities = options.enableEntities;
+    }
+
+    const pollingIntervalMs =
+      options?.pollingIntervalMs ?? DEFAULT_POLLING_INTERVAL_MS;
+    const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+
+    // Warn rather than change what the caller asked for.
+    if (multilingual && options?.additionalVocab != null) {
+      warnings.push({
+        type: 'unsupported',
+        feature: 'providerOptions.speechmatics.additionalVocab',
+        details: `Speechmatics does not support custom vocabulary on ${this.modelId}. The job may be rejected or the vocabulary ignored.`,
+      });
+    }
+    if (multilingual && options?.enableEntities === true) {
+      warnings.push({
+        type: 'other',
+        message: `On ${this.modelId}, Speechmatics only accepts enable_entities together with Entity Detection (entities_config.detect_advanced_entities), which this provider does not set. The job may be rejected.`,
+      });
+    }
+    if (pollingIntervalMs >= timeoutMs) {
+      warnings.push({
+        type: 'other',
+        message: `pollingIntervalMs (${pollingIntervalMs}) is not smaller than timeoutMs (${timeoutMs}), so the job is abandoned after its first status check.`,
+      });
+    }
+
+    return {
+      transcriptionConfig,
+      warnings,
+      pollingIntervalMs,
+      timeoutMs,
+      includeSpeakers:
+        options?.diarization === 'speaker' ||
+        options?.diarization === 'channel',
+    };
+  }
+
+  async doGenerate(options: GenerateOptions): Promise<GenerateResult> {
+    const bytes =
+      typeof options.audio === 'string'
+        ? convertBase64ToUint8Array(options.audio)
+        : options.audio;
+
+    const formData = new FormData();
+    formData.append(
+      'data_file',
+      new Blob([bytes as Uint8Array<ArrayBuffer>], { type: options.mediaType }),
+      `audio.${FILE_EXTENSIONS[options.mediaType] ?? 'bin'}`,
+    );
+
+    return this.runJob(options, formData);
+  }
+
+  async doGenerateFromUrl(
+    options: GenerateFromUrlOptions,
+  ): Promise<GenerateResult | undefined> {
+    // Speechmatics fetches http(s) URLs itself. Anything else (data: URLs and
+    // so on) falls back to the SDK downloading the audio and calling doGenerate.
+    if (
+      options.audio.protocol !== 'http:' &&
+      options.audio.protocol !== 'https:'
+    ) {
+      return undefined;
+    }
+
+    return this.runJob(options, new FormData(), options.audio.toString());
+  }
+
+  private async runJob(
+    options: Pick<GenerateOptions, 'providerOptions' | 'abortSignal' | 'headers'>,
+    formData: FormData,
+    fetchUrl?: string,
+  ): Promise<GenerateResult> {
+    const currentDate = this.config._internal?.currentDate?.() ?? new Date();
+    const {
+      transcriptionConfig,
+      warnings,
+      pollingIntervalMs,
+      timeoutMs,
+      includeSpeakers,
+    } = await this.getArgs(options);
+
+    const jobConfig: SpeechmaticsJobConfig = {
+      type: 'transcription',
+      transcription_config: transcriptionConfig,
+      ...(fetchUrl != null ? { fetch_data: { url: fetchUrl } } : {}),
+    };
+    const requestBody = JSON.stringify(jobConfig);
+    formData.append('config', requestBody);
+
+    const headers = combineHeaders(
+      await resolve(this.config.headers),
+      options.headers,
+    );
+
+    const { value: created } = await postFormDataToApi({
+      url: this.config.url({ path: '/v2/jobs' }),
+      headers,
+      formData,
+      failedResponseHandler: speechmaticsFailedResponseHandler,
+      successfulResponseHandler: createJsonResponseHandler(
+        createJobResponseSchema,
+      ),
+      abortSignal: options.abortSignal,
+      fetch: this.config.fetch,
+    });
+
+    const job = await this.waitForJob({
+      id: created.id,
+      headers,
+      abortSignal: options.abortSignal,
+      pollingIntervalMs,
+      timeoutMs,
+    });
+
+    const {
+      value: transcript,
+      rawValue,
+      responseHeaders,
+    } = await getFromApi({
+      url: this.config.url({
+        path: `/v2/jobs/${created.id}/transcript?format=json-v2`,
+      }),
+      headers,
+      failedResponseHandler: speechmaticsFailedResponseHandler,
+      successfulResponseHandler: createJsonResponseHandler(
+        transcriptResponseSchema,
+      ),
+      abortSignal: options.abortSignal,
+      fetch: this.config.fetch,
+      validateUrl: false,
+    });
+
+    const { text, segments, words, utterances, entities } = buildTranscript(
+      transcript.results,
+      transcript.metadata?.language_pack_info?.word_delimiter ?? ' ',
+      { includeSpeakers },
+    );
+
+    const durationInSeconds =
+      job.duration ??
+      transcript.results.reduce(
+        (latest, item) => Math.max(latest, item.end_time),
+        0,
+      );
+
+    return {
+      text,
+      segments,
+      ...(words.length > 0 ? { words } : {}),
+      language:
+        transcript.metadata?.transcription_config?.language ?? undefined,
+      durationInSeconds,
+      usage: { seconds: durationInSeconds },
+      warnings,
+      request: { body: requestBody },
+      response: {
+        timestamp: currentDate,
+        modelId: this.modelId,
+        headers: responseHeaders,
+        body: rawValue,
+      },
+      // Speaker turns and entities have no place in the AI SDK result shape, so
+      // they go here. All times are in seconds, like `segments`.
+      providerMetadata: {
+        speechmatics: {
+          jobId: created.id,
+          ...(utterances != null ? { utterances } : {}),
+          ...(entities != null ? { entities } : {}),
+        },
+      },
+    };
+  }
+
+  private async waitForJob({
+    id,
+    headers,
+    abortSignal,
+    pollingIntervalMs,
+    timeoutMs,
+  }: {
+    id: string;
+    headers: Record<string, string | undefined>;
+    abortSignal: AbortSignal | undefined;
+    pollingIntervalMs: number;
+    timeoutMs: number;
+  }) {
+    const url = this.config.url({ path: `/v2/jobs/${id}` });
+    const deadline = Date.now() + timeoutMs;
+
+    while (true) {
+      const { value: response } = await getFromApi({
+        url,
+        headers,
+        failedResponseHandler: speechmaticsFailedResponseHandler,
+        successfulResponseHandler: createJsonResponseHandler(
+          jobResponseSchema,
+        ),
+        abortSignal,
+        fetch: this.config.fetch,
+        validateUrl: false,
+      });
+      const { job } = response;
+
+      if (job.status === 'done') {
+        return job;
+      }
+
+      if (FAILED_JOB_STATUSES.has(job.status)) {
+        const details = (job.errors ?? [])
+          .map(error => error.message)
+          .filter((message): message is string => message != null)
+          .join('; ');
+
+        throw new APICallError({
+          message: `Speechmatics job ${id} ${job.status}${
+            details.length > 0 ? `: ${details}` : ''
+          }`,
+          url,
+          requestBodyValues: {},
+          isRetryable: false,
+          data: response,
+        });
+      }
+
+      if (Date.now() + pollingIntervalMs > deadline) {
+        throw new APICallError({
+          message: `Speechmatics job ${id} did not finish within ${timeoutMs}ms`,
+          url,
+          requestBodyValues: {},
+          isRetryable: false,
+        });
+      }
+
+      await delay(pollingIntervalMs, { abortSignal });
+    }
+  }
+}
+
+const createJobResponseSchema = lazySchema(() =>
+  zodSchema(
+    z.object({
+      id: z.string(),
+    }),
+  ),
+);
+
+const jobResponseSchema = lazySchema(() =>
+  zodSchema(
+    z.object({
+      job: z.object({
+        id: z.string(),
+        status: z.string(),
+        duration: z.number().nullish(),
+        errors: z
+          .array(
+            z.object({
+              message: z.string().nullish(),
+            }),
+          )
+          .nullish(),
+      }),
+    }),
+  ),
+);
+
+const transcriptResponseSchema = lazySchema(() =>
+  zodSchema(
+    z.object({
+      metadata: z
+        .object({
+          transcription_config: z
+            .object({
+              language: z.string().nullish(),
+            })
+            .nullish(),
+          language_pack_info: z
+            .object({
+              word_delimiter: z.string().nullish(),
+            })
+            .nullish(),
+        })
+        .nullish(),
+      results: z.array(
+        z.object({
+          type: z.string(),
+          start_time: z.number(),
+          end_time: z.number(),
+          is_eos: z.boolean().nullish(),
+          attaches_to: z.string().nullish(),
+          entity_class: z.string().nullish(),
+          alternatives: z
+            .array(
+              z.object({
+                content: z.string(),
+                speaker: z.string().nullish(),
+              }),
+            )
+            .nullish(),
+        }),
+      ),
+    }),
+  ),
+);
