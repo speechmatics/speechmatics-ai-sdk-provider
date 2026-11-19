@@ -56,8 +56,10 @@ export const speechmaticsTranscriptionModelOptionsSchema = lazySchema(() =>
       pollingIntervalMs: z.number().int().positive().optional(),
 
       /**
-       * How long to wait for the job to finish, in milliseconds.
-       * Defaults to 15 minutes.
+       * Time limit for the job to finish, in milliseconds. It covers the
+       * initial wait and polling, but does not cut short the transcript
+       * download of a finished job. Defaults to 15 minutes. When it runs out, a
+       * running job is cancelled and an error is thrown.
        */
       timeoutMs: z.number().int().positive().optional(),
     }),

@@ -96,11 +96,13 @@ const errorResponse = (status: number) =>
 function createMockFetch({
   jobStatuses = [runningJob, doneJob],
   createResponse = () => jsonResponse({ id: 'job-1' }, 201),
+  deleteResponse = () => jsonResponse({ job: { id: 'job-1', status: 'deleted' } }),
   transcriptBody = transcript as unknown,
   transcriptReplies = [transcriptBody],
 }: {
   jobStatuses?: Reply[];
   createResponse?: () => Response;
+  deleteResponse?: () => Response;
   transcriptBody?: unknown;
   transcriptReplies?: Reply[];
 } = {}) {
@@ -130,6 +132,9 @@ function createMockFetch({
 
     if (method === 'POST' && url.pathname === '/v2/jobs') {
       return createResponse();
+    }
+    if (method === 'DELETE' && url.pathname === '/v2/jobs/job-1') {
+      return deleteResponse();
     }
     if (url.pathname === '/v2/jobs/job-1/transcript') {
       return reply(
@@ -493,14 +498,42 @@ describe('SpeechmaticsTranscriptionModel models and warnings', () => {
     expect(enhanced.result.warnings).toEqual([]);
   });
 
-  it('warns when the polling interval cannot fit inside the timeout', async () => {
-    const { result } = await call('enhanced', {
-      pollingIntervalMs: 10,
-      timeoutMs: 10,
+  it('warns when polling is needed but the interval cannot fit inside the timeout', async () => {
+    const { fetch } = createMockFetch({ jobStatuses: [doneJob] });
+    const result = await generate(fetch, {
+      pollingIntervalMs: 2_000,
+      timeoutMs: 2_000,
     });
 
     expect(result.warnings).toHaveLength(1);
     expect(result.warnings[0]).toMatchObject({ type: 'other' });
+    expect((result.warnings[0] as { message: string }).message).toContain(
+      'pollingIntervalMs',
+    );
+  });
+
+  it('does not warn about the interval when the job finished during creation', async () => {
+    const { fetch } = createMockFetch({
+      createResponse: () =>
+        jsonResponse({ id: 'job-1', status: 'done', 'json-v2': transcript }, 201),
+    });
+    const result = await generate(fetch, {
+      pollingIntervalMs: 2_000,
+      timeoutMs: 2_000,
+    });
+
+    expect(result.warnings).toEqual([]);
+  });
+
+  it('warns that a timeout under two seconds skips the initial wait', async () => {
+    const { fetch, calls } = createMockFetch();
+    const result = await generate(fetch, { timeoutMs: 500 });
+
+    expect(result.warnings).toHaveLength(1);
+    expect((result.warnings[0] as { message: string }).message).toContain(
+      'under 2000',
+    );
+    expect(calls[0].url.searchParams.has('wait')).toBe(false);
   });
 });
 
@@ -533,16 +566,17 @@ describe('SpeechmaticsTranscriptionModel waiting and polling', () => {
       expect(calls[0].url.searchParams.get('format')).toBe('json-v2');
     });
 
-    it('never waits longer than the timeout', async () => {
+    it('waits at most half the timeout, leaving time to poll', async () => {
       const { fetch, calls } = createMockFetch();
-      await generate(fetch, { timeoutMs: 10_000 });
+      await generate(fetch, { timeoutMs: 20_000 });
       expect(calls[0].url.searchParams.get('wait')).toBe('10');
     });
 
-    it('waits at least one second, because wait=0 means no wait', async () => {
+    it('skips the wait below one second, because wait=0 means no wait', async () => {
       const { fetch, calls } = createMockFetch();
       await generate(fetch, { timeoutMs: 500, pollingIntervalMs: 1 });
-      expect(calls[0].url.searchParams.get('wait')).toBe('1');
+      expect(calls[0].url.pathname).toBe('/v2/jobs');
+      expect(calls[0].url.search).toBe('');
     });
 
     it('uses the embedded transcript and makes no further requests', async () => {
@@ -748,10 +782,40 @@ describe('SpeechmaticsTranscriptionModel waiting and polling', () => {
 
       expect(APICallError.isInstance(error)).toBe(true);
       expect(error.statusCode).toBe(503);
-      // one attempt plus three tolerated retries
+      // The job may still be running, so the SDK must not start a second one.
+      expect(error.isRetryable).toBe(false);
+      expect(error.message).toContain('could not be cancelled');
+      // one attempt plus three tolerated retries, then one status check before
+      // trying to cancel the job
       expect(requests(calls).filter(r => r === 'GET /v2/jobs/job-1')).toHaveLength(
-        4,
+        5,
       );
+    });
+
+    it('returns the transcript if the job finished during repeated transient errors', async () => {
+      const failing = () => errorResponse(503);
+      const { fetch, calls } = createMockFetch({
+        jobStatuses: [failing, failing, failing, failing, doneJob],
+      });
+
+      const result = await generate(fetch);
+
+      expect(result.text).toBe('Hello, world. How are you?');
+      expect(requests(calls)).not.toContain('DELETE /v2/jobs/job-1');
+    });
+
+    it('cancels the job after repeated transient errors if it is still running', async () => {
+      const failing = () => errorResponse(503);
+      const { fetch, calls } = createMockFetch({
+        jobStatuses: [failing, failing, failing, failing, runningJob],
+      });
+
+      const error = await generate(fetch).catch((e: any) => e);
+
+      expect(error.statusCode).toBe(503);
+      expect(error.isRetryable).toBe(false);
+      expect(error.message).toContain('The job was cancelled.');
+      expect(requests(calls)).toContain('DELETE /v2/jobs/job-1');
     });
 
     it('does not retry errors that are not transient', async () => {
@@ -762,8 +826,9 @@ describe('SpeechmaticsTranscriptionModel waiting and polling', () => {
       const error = await generate(fetch).catch((e: any) => e);
 
       expect(error.statusCode).toBe(401);
+      // the failed poll, then one status check before trying to cancel
       expect(requests(calls).filter(r => r === 'GET /v2/jobs/job-1')).toHaveLength(
-        1,
+        2,
       );
     });
 
@@ -836,6 +901,227 @@ describe('SpeechmaticsTranscriptionModel waiting and polling', () => {
         requests(calls).filter(r => r === 'GET /v2/jobs/job-1/transcript'),
       ).toHaveLength(1);
     });
+  });
+});
+
+describe('SpeechmaticsTranscriptionModel cancelling and time limits', () => {
+  const timesOut = { timeoutMs: 30, pollingIntervalMs: 10 };
+
+  it('cancels a running job when it times out, and says so', async () => {
+    const { fetch, calls } = createMockFetch({ jobStatuses: [runningJob] });
+
+    const error = await generate(fetch, timesOut).catch((e: any) => e);
+
+    expect(error.message).toContain('did not finish within 30ms');
+    expect(error.message).toContain('The job was cancelled.');
+    expect(error.isRetryable).toBe(false);
+
+    const deleteIndex = requests(calls).indexOf('DELETE /v2/jobs/job-1');
+    expect(deleteIndex).toBeGreaterThan(0);
+    // it looks before it deletes, and forces, because the job is running
+    expect(requests(calls)[deleteIndex - 1]).toBe('GET /v2/jobs/job-1');
+    expect(calls[deleteIndex].url.searchParams.get('force')).toBe('true');
+    expect(calls[deleteIndex].headers.get('authorization')).toBe('Bearer k');
+  });
+
+  it('says so when the job could not be cancelled', async () => {
+    const { fetch } = createMockFetch({
+      jobStatuses: [runningJob],
+      deleteResponse: () => errorResponse(500),
+    });
+
+    const error = await generate(fetch, timesOut).catch((e: any) => e);
+
+    expect(error.message).toContain('did not finish within 30ms');
+    expect(error.message).toContain('could not be cancelled');
+  });
+
+  it('returns the transcript if the job finished while we were giving up', async () => {
+    // The interval is longer than the timeout, so time is always up after the
+    // first poll. The check inside cancelling then sees `done`.
+    const { fetch, calls } = createMockFetch({
+      jobStatuses: [runningJob, doneJob],
+    });
+
+    const result = await generate(fetch, {
+      timeoutMs: 5,
+      pollingIntervalMs: 10,
+    });
+
+    expect(result.text).toBe('Hello, world. How are you?');
+    expect(requests(calls)).toEqual([
+      'POST /v2/jobs',
+      'GET /v2/jobs/job-1',
+      'GET /v2/jobs/job-1',
+      'GET /v2/jobs/job-1/transcript',
+    ]);
+  });
+
+  it('reports a timeout, not the transient error, when time runs out during transient errors', async () => {
+    const { fetch } = createMockFetch({
+      jobStatuses: [() => errorResponse(503), runningJob],
+    });
+
+    const error = await generate(fetch, {
+      timeoutMs: 5,
+      pollingIntervalMs: 10,
+    }).catch((e: any) => e);
+
+    expect(error.message).toContain('did not finish within 5ms');
+    expect(error.message).toContain('The job was cancelled.');
+    expect(error.isRetryable).toBe(false);
+    expect(error.cause.cause.statusCode).toBe(503);
+  });
+
+  it('does not delete a finished job when the transcript download fails', async () => {
+    const { fetch, calls } = createMockFetch({
+      jobStatuses: [doneJob],
+      transcriptReplies: [() => errorResponse(401)],
+    });
+
+    const error = await generate(fetch).catch((e: any) => e);
+
+    expect(error.statusCode).toBe(401);
+    expect(requests(calls)).not.toContain('DELETE /v2/jobs/job-1');
+  });
+
+  const abortAfterFirstPoll = (
+    base: typeof globalThis.fetch,
+    controller: AbortController,
+  ) =>
+    (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await base(input, init);
+      const url = new URL(String(input));
+      if (
+        url.pathname === '/v2/jobs/job-1' &&
+        (init?.method ?? 'GET') === 'GET' &&
+        !controller.signal.aborted
+      ) {
+        controller.abort(new Error('caller gave up'));
+      }
+      return response;
+    }) as unknown as typeof globalThis.fetch;
+
+  const generateAbortable = (
+    fetch: typeof globalThis.fetch,
+    abortSignal: AbortSignal,
+  ) =>
+    Promise.resolve(
+      createSpeechmatics({ apiKey: 'k', fetch })
+        .transcription()
+        .doGenerate({
+          audio: new Uint8Array([1]),
+          mediaType: 'audio/wav',
+          abortSignal,
+          providerOptions: { speechmatics: { pollingIntervalMs: 10 } },
+        }),
+    );
+
+  it('cancels the job when the caller aborts while polling', async () => {
+    const controller = new AbortController();
+    const { fetch: base, calls } = createMockFetch({
+      jobStatuses: [runningJob],
+    });
+
+    const error = await generateAbortable(
+      abortAfterFirstPoll(base, controller),
+      controller.signal,
+    ).catch((e: any) => e);
+
+    expect(error).toBeDefined();
+    expect(requests(calls)).toContain('DELETE /v2/jobs/job-1');
+  });
+
+  it('throws the abort error, not the cancel error, when cancelling fails', async () => {
+    const controller = new AbortController();
+    const { fetch: base } = createMockFetch({
+      jobStatuses: [runningJob],
+      deleteResponse: () => errorResponse(500),
+    });
+
+    const error = await generateAbortable(
+      abortAfterFirstPoll(base, controller),
+      controller.signal,
+    ).catch((e: any) => e);
+
+    expect(error.statusCode).toBeUndefined();
+  });
+
+  it('does not try to cancel when the job was never created', async () => {
+    const { fetch, calls } = createMockFetch({
+      createResponse: () => errorResponse(401),
+    });
+
+    const error = await generate(fetch).catch((e: any) => e);
+
+    expect(error.statusCode).toBe(401);
+    expect(requests(calls)).toEqual(['POST /v2/jobs']);
+  });
+
+  it('does not cancel a job that succeeded', async () => {
+    const { fetch, calls } = createMockFetch();
+    await generate(fetch);
+    expect(requests(calls)).not.toContain('DELETE /v2/jobs/job-1');
+  });
+
+  it('keeps trying to download the transcript of a finished job after the time is up', async () => {
+    const notReady = () =>
+      jsonResponse({ code: 404, error: 'Transcription not ready' }, 404);
+    const { fetch, calls } = createMockFetch({
+      jobStatuses: [doneJob],
+      transcriptReplies: [notReady, notReady, transcript],
+    });
+
+    const result = await generate(fetch, {
+      timeoutMs: 5,
+      pollingIntervalMs: 10,
+    });
+
+    expect(result.text).toBe('Hello, world. How are you?');
+    expect(
+      requests(calls).filter(r => r === 'GET /v2/jobs/job-1/transcript'),
+    ).toHaveLength(3);
+  });
+
+  it('retries the transcript download at most every second', async () => {
+    vi.useFakeTimers();
+    try {
+      const notReady = () =>
+        jsonResponse({ code: 404, error: 'Transcription not ready' }, 404);
+      const { fetch, calls } = createMockFetch({
+        jobStatuses: [doneJob],
+        transcriptReplies: [notReady, transcript],
+      });
+      const promise = createSpeechmatics({ apiKey: 'k', fetch })
+        .transcription()
+        .doGenerate({ audio: new Uint8Array([1]), mediaType: 'audio/wav' });
+      const downloads = () =>
+        calls.filter(c => c.url.pathname === '/v2/jobs/job-1/transcript')
+          .length;
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(downloads()).toBe(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(downloads()).toBe(2);
+
+      await expect(promise).resolves.toMatchObject({
+        text: 'Hello, world. How are you?',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not let the SDK rerun a call whose job already finished', async () => {
+    const { fetch } = createMockFetch({
+      jobStatuses: [doneJob],
+      transcriptReplies: [() => errorResponse(503)],
+    });
+
+    const error = await generate(fetch).catch((e: any) => e);
+
+    expect(error.statusCode).toBe(503);
+    expect(error.isRetryable).toBe(false);
   });
 });
 

@@ -4,6 +4,7 @@ import {
   combineHeaders,
   convertBase64ToUint8Array,
   createJsonResponseHandler,
+  deleteFromApi,
   delay,
   getFromApi,
   lazySchema,
@@ -43,8 +44,13 @@ const MAX_CREATE_WAIT_SECONDS = 30;
 const MAX_TRANSIENT_POLL_ERRORS = 3;
 // A finished job's transcript can lag behind its status by a moment.
 const MAX_TRANSCRIPT_ATTEMPTS = 5;
+const MAX_TRANSCRIPT_RETRY_DELAY_MS = 1_000;
 
 const FAILED_JOB_STATUSES = new Set(['rejected', 'deleted', 'expired']);
+
+// Cancelling a job is best-effort cleanup. It gets its own time limit because
+// the caller's abort signal has usually already fired by then.
+const CANCEL_TIMEOUT_MS = 5_000;
 
 const FILE_EXTENSIONS: Record<string, string> = {
   'audio/mpeg': 'mp3',
@@ -161,10 +167,10 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
         message: `On ${this.modelId}, Speechmatics only accepts enable_entities together with Entity Detection (entities_config.detect_advanced_entities), which this provider does not set. The job may be rejected.`,
       });
     }
-    if (pollingIntervalMs >= timeoutMs) {
+    if (timeoutMs < 2_000) {
       warnings.push({
         type: 'other',
-        message: `pollingIntervalMs (${pollingIntervalMs}) is not smaller than timeoutMs (${timeoutMs}), so the job is abandoned after its first status check.`,
+        message: `timeoutMs (${timeoutMs}) is under 2000, so job creation does not wait for the result and every job is polled.`,
       });
     }
 
@@ -237,17 +243,30 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
       options.headers,
     );
 
-    const createWaitSeconds = Math.max(
-      1,
-      Math.min(MAX_CREATE_WAIT_SECONDS, Math.floor(timeoutMs / 1_000)),
+    // One clock for the job. The initial wait and polling both draw from
+    // `timeoutMs`.
+    const deadline = Date.now() + timeoutMs;
+
+    // The wait is capped by the server's connection timeout and by half of
+    // `timeoutMs`, so a job still running after it has time left to be polled.
+    // `wait=0` means no wait, so below one second go straight to polling.
+    const createWaitSeconds = Math.min(
+      MAX_CREATE_WAIT_SECONDS,
+      Math.floor(timeoutMs / 2_000),
     );
+
+    // If the caller aborts during this request the job may exist, but its id
+    // never arrives, so there is nothing to cancel.
     const {
       value: created,
       rawValue: createdRawValue,
       responseHeaders: createdResponseHeaders,
     } = await postFormDataToApi({
       url: this.config.url({
-        path: `/v2/jobs?wait=${createWaitSeconds}&format=json-v2`,
+        path:
+          createWaitSeconds >= 1
+            ? `/v2/jobs?wait=${createWaitSeconds}&format=json-v2`
+            : '/v2/jobs',
       }),
       headers,
       formData,
@@ -259,46 +278,31 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
       fetch: this.config.fetch,
     });
 
-    // With `wait`, a job that finishes in time comes back with its transcript
-    // embedded. That is best-effort, so anything unusable falls through to polling.
-    let embedded: z.infer<typeof transcriptShape> | undefined;
-    if (created.status === 'done' && created['json-v2'] != null) {
-      const validated = await safeValidateTypes({
-        value: created['json-v2'],
-        schema: transcriptResponseSchema,
-      });
-      if (validated.success) {
-        embedded = validated.value;
-      }
-    }
-
-    let job: { duration?: number | null } | undefined;
-    let transcript: z.infer<typeof transcriptShape>;
-    let rawValue: unknown = createdRawValue;
-    let responseHeaders = createdResponseHeaders;
-
-    if (embedded != null) {
-      transcript = embedded;
-    } else {
-      job = await this.waitForJob({
-        id: created.id,
+    // From here the job exists on the server. If anything fails, cancel it so
+    // it does not keep running and billing with nobody waiting for it.
+    let completed: CompletedJob;
+    try {
+      completed = await this.completeJob({
+        created,
+        createdRawValue,
+        createdResponseHeaders,
         headers,
         abortSignal: options.abortSignal,
         pollingIntervalMs,
         timeoutMs,
+        deadline,
+        warnings,
       });
-
-      ({
-        value: transcript,
-        rawValue,
-        responseHeaders,
-      } = await this.fetchTranscript({
+    } catch (error) {
+      completed = await this.recoverOrCancel({
+        error,
         id: created.id,
         headers,
         abortSignal: options.abortSignal,
         pollingIntervalMs,
-      }));
+      });
     }
+    const { transcript, job, rawValue, responseHeaders } = completed;
 
     const { text, segments, words, utterances, entities } = buildTranscript(
       transcript.results,
@@ -342,6 +346,79 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
     };
   }
 
+  private async completeJob({
+    created,
+    createdRawValue,
+    createdResponseHeaders,
+    headers,
+    abortSignal,
+    pollingIntervalMs,
+    timeoutMs,
+    deadline,
+    warnings,
+  }: {
+    created: { id: string; status?: string | null; 'json-v2'?: unknown };
+    createdRawValue: unknown;
+    createdResponseHeaders: Record<string, string> | undefined;
+    headers: Record<string, string | undefined>;
+    abortSignal: AbortSignal | undefined;
+    pollingIntervalMs: number;
+    timeoutMs: number;
+    deadline: number;
+    warnings: SharedV4Warning[];
+  }): Promise<CompletedJob> {
+    // With `wait`, a job that finishes in time comes back with its transcript
+    // embedded. That is best-effort, so anything unusable falls through to polling.
+    if (created.status === 'done' && created['json-v2'] != null) {
+      const validated = await safeValidateTypes({
+        value: created['json-v2'],
+        schema: transcriptResponseSchema,
+      });
+      if (validated.success) {
+        return {
+          transcript: validated.value as z.infer<typeof transcriptShape>,
+          job: undefined,
+          rawValue: createdRawValue,
+          responseHeaders: createdResponseHeaders,
+        };
+      }
+    }
+
+    const remainingMs = deadline - Date.now();
+    if (pollingIntervalMs >= remainingMs) {
+      warnings.push({
+        type: 'other',
+        message: `pollingIntervalMs (${pollingIntervalMs}) is not smaller than the ${Math.max(0, remainingMs)}ms of timeoutMs left after job creation, so a job that is not finished is cancelled after one status check.`,
+      });
+    }
+
+    const job = await this.waitForJob({
+      id: created.id,
+      headers,
+      abortSignal,
+      pollingIntervalMs,
+      timeoutMs,
+      deadline,
+    });
+
+    const {
+      value: transcript,
+      rawValue,
+      responseHeaders,
+    } = await this.fetchTranscript({
+      id: created.id,
+      headers,
+      abortSignal,
+      pollingIntervalMs,
+    });
+
+    return { transcript, job, rawValue, responseHeaders };
+  }
+
+  /**
+   * Downloads the transcript of a finished job. Not bound by `timeoutMs`: the
+   * job is done and billed, so giving up early would throw the result away.
+   */
   private async fetchTranscript({
     id,
     headers,
@@ -353,12 +430,14 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
     abortSignal: AbortSignal | undefined;
     pollingIntervalMs: number;
   }) {
+    const url = this.config.url({
+      path: `/v2/jobs/${id}/transcript?format=json-v2&wait=0`,
+    });
+
     for (let attempt = 1; ; attempt++) {
       try {
         return await getFromApi({
-          url: this.config.url({
-            path: `/v2/jobs/${id}/transcript?format=json-v2&wait=0`,
-          }),
+          url,
           headers,
           failedResponseHandler: speechmaticsFailedResponseHandler,
           successfulResponseHandler: createJsonResponseHandler(
@@ -370,13 +449,30 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
         });
       } catch (error) {
         // 404 means the transcript is not ready yet.
-        const retryable =
-          isTransientError(error) ||
-          (APICallError.isInstance(error) && error.statusCode === 404);
-        if (!retryable || attempt >= MAX_TRANSCRIPT_ATTEMPTS) {
+        const notReady =
+          APICallError.isInstance(error) && error.statusCode === 404;
+        const retryable = isTransientError(error) || notReady;
+        if (!retryable) {
           throw error;
         }
-        await delay(pollingIntervalMs, { abortSignal });
+
+        if (attempt >= MAX_TRANSCRIPT_ATTEMPTS) {
+          // The job itself is done, so a retry of the whole call would create
+          // and bill a second job. Mark this as not retryable.
+          throw new APICallError({
+            message: `Speechmatics job ${id} finished but its transcript could not be downloaded after ${attempt} attempt${attempt === 1 ? '' : 's'}`,
+            url,
+            requestBodyValues: {},
+            statusCode: APICallError.isInstance(error)
+              ? error.statusCode
+              : undefined,
+            isRetryable: false,
+            cause: error,
+          });
+        }
+        await delay(Math.min(pollingIntervalMs, MAX_TRANSCRIPT_RETRY_DELAY_MS), {
+          abortSignal,
+        });
       }
     }
   }
@@ -387,18 +483,29 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
     abortSignal,
     pollingIntervalMs,
     timeoutMs,
+    deadline,
   }: {
     id: string;
     headers: Record<string, string | undefined>;
     abortSignal: AbortSignal | undefined;
     pollingIntervalMs: number;
     timeoutMs: number;
+    deadline: number;
   }) {
     // `wait=0` returns immediately. Without it the server applies a default
     // wait that is unspecified and will grow, which would skew the interval.
     const url = this.config.url({ path: `/v2/jobs/${id}?wait=0` });
-    const deadline = Date.now() + timeoutMs;
     let transientErrors = 0;
+
+    const timedOut = (cause?: unknown) =>
+      new APICallError({
+        message: `Speechmatics job ${id} did not finish within ${timeoutMs}ms`,
+        url,
+        requestBodyValues: {},
+        isRetryable: false,
+        data: { timedOut: true },
+        cause,
+      });
 
     while (true) {
       let response;
@@ -418,10 +525,12 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
       } catch (error) {
         if (
           !isTransientError(error) ||
-          ++transientErrors > MAX_TRANSIENT_POLL_ERRORS ||
-          Date.now() + pollingIntervalMs > deadline
+          ++transientErrors > MAX_TRANSIENT_POLL_ERRORS
         ) {
           throw error;
+        }
+        if (Date.now() + pollingIntervalMs > deadline) {
+          throw timedOut(error);
         }
         await delay(pollingIntervalMs, { abortSignal });
         continue;
@@ -450,18 +559,160 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
       }
 
       if (Date.now() + pollingIntervalMs > deadline) {
-        throw new APICallError({
-          message: `Speechmatics job ${id} did not finish within ${timeoutMs}ms`,
-          url,
-          requestBodyValues: {},
-          isRetryable: false,
-        });
+        throw timedOut();
       }
 
       await delay(pollingIntervalMs, { abortSignal });
     }
   }
+
+  /**
+   * Handles a failure after the job was created. A job that is still running is
+   * cancelled. A timeout or a run of transient errors says nothing about the
+   * job itself, so if it turns out to have finished, its transcript is returned
+   * instead: the job is billed either way.
+   *
+   * Otherwise the original error is thrown, never a cancel error, and never as
+   * retryable, because the SDK retries by rerunning the call, which would
+   * create and bill a second job. A timeout or transient error also says what
+   * happened to the job, because that is the case where the caller is left
+   * wondering.
+   */
+  private async recoverOrCancel({
+    error,
+    id,
+    headers,
+    abortSignal,
+    pollingIntervalMs,
+  }: {
+    error: unknown;
+    id: string;
+    headers: Record<string, string | undefined>;
+    abortSignal: AbortSignal | undefined;
+    pollingIntervalMs: number;
+  }): Promise<CompletedJob> {
+    const outcome = await this.cancelJob({ id, headers });
+
+    const unsettled = isTimeoutError(error) || isTransientError(error);
+    if (unsettled && outcome === 'done' && abortSignal?.aborted !== true) {
+      try {
+        const {
+          value: transcript,
+          rawValue,
+          responseHeaders,
+        } = await this.fetchTranscript({
+          id,
+          headers,
+          abortSignal,
+          pollingIntervalMs,
+        });
+        return { transcript, job: undefined, rawValue, responseHeaders };
+      } catch {
+        // Fall through to the original error.
+      }
+    }
+
+    if (!APICallError.isInstance(error)) {
+      throw error;
+    }
+
+    const note = unsettled ? CANCEL_OUTCOME_NOTES[outcome] : undefined;
+    if (note == null && !error.isRetryable) {
+      throw error;
+    }
+    throw new APICallError({
+      message: note != null ? `${error.message}.${note}` : error.message,
+      url: error.url,
+      requestBodyValues: error.requestBodyValues,
+      statusCode: error.statusCode,
+      responseHeaders: error.responseHeaders,
+      responseBody: error.responseBody,
+      isRetryable: false,
+      data: error.data,
+      cause: error,
+    });
+  }
+
+  /**
+   * Stops a job that is still running. It looks first, so a job that already
+   * finished is left alone. Uses its own time limit, since the caller's abort
+   * signal has usually already fired.
+   *
+   * - `cancelled`: the job was running and was force-terminated.
+   * - `done`: the job had already finished successfully.
+   * - `ended`: the job had already failed or is gone, so nothing to stop.
+   * - `failed`: the job could not be checked or stopped.
+   */
+  private async cancelJob({
+    id,
+    headers,
+  }: {
+    id: string;
+    headers: Record<string, string | undefined>;
+  }): Promise<CancelOutcome> {
+    const abortSignal = AbortSignal.timeout(CANCEL_TIMEOUT_MS);
+
+    try {
+      const {
+        value: { job },
+      } = await getFromApi({
+        url: this.config.url({ path: `/v2/jobs/${id}?wait=0` }),
+        headers,
+        failedResponseHandler: speechmaticsFailedResponseHandler,
+        successfulResponseHandler: createJsonResponseHandler(jobResponseSchema),
+        abortSignal,
+        fetch: this.config.fetch,
+        validateUrl: false,
+      });
+
+      if (job.status === 'done') {
+        return 'done';
+      }
+      if (FAILED_JOB_STATUSES.has(job.status)) {
+        return 'ended';
+      }
+
+      // Without `force` the server refuses to delete a running job (423).
+      await deleteFromApi({
+        url: this.config.url({ path: `/v2/jobs/${id}?force=true` }),
+        headers,
+        failedResponseHandler: speechmaticsFailedResponseHandler,
+        successfulResponseHandler: createJsonResponseHandler(
+          ignoredResponseSchema,
+        ),
+        abortSignal,
+        fetch: this.config.fetch,
+      });
+      return 'cancelled';
+    } catch (error) {
+      // 404 and 410 mean the job is already gone.
+      if (
+        APICallError.isInstance(error) &&
+        (error.statusCode === 404 || error.statusCode === 410)
+      ) {
+        return 'ended';
+      }
+      return 'failed';
+    }
+  }
 }
+
+type CancelOutcome = 'cancelled' | 'done' | 'ended' | 'failed';
+
+const CANCEL_OUTCOME_NOTES: Record<CancelOutcome, string | undefined> = {
+  cancelled: ' The job was cancelled.',
+  done: ' The job finished, but its transcript could not be downloaded.',
+  ended: undefined,
+  failed:
+    ' The job could not be cancelled and may still be running and billed.',
+};
+
+type CompletedJob = {
+  transcript: z.infer<typeof transcriptShape>;
+  job: { duration?: number | null } | undefined;
+  rawValue: unknown;
+  responseHeaders: Record<string, string> | undefined;
+};
 
 const createJobResponseSchema = lazySchema(() =>
   zodSchema(
@@ -477,8 +728,14 @@ const createJobResponseSchema = lazySchema(() =>
   ),
 );
 
+const ignoredResponseSchema = lazySchema(() => zodSchema(z.unknown()));
+
 const isTransientError = (error: unknown) =>
   APICallError.isInstance(error) && error.isRetryable;
+
+const isTimeoutError = (error: unknown) =>
+  APICallError.isInstance(error) &&
+  (error.data as { timedOut?: boolean } | undefined)?.timedOut === true;
 
 const jobResponseSchema = lazySchema(() =>
   zodSchema(

@@ -42,6 +42,22 @@ const { text, segments } = await transcribe({
 });
 ```
 
+Short files finish in a single request: job creation waits up to 30 seconds for
+the result, or half of `timeoutMs` if that is less, so there is time left to
+poll. Longer jobs are then polled.
+
+If the call fails after the job was created, whether from an abort, a timeout or
+an error, the package checks the job. If it is still running, it is cancelled so
+it does not keep running and billing. If it finished after all, for example just
+as time ran out, its transcript is returned instead of an error. Cancelling is
+best effort and has its own 5 second limit. If the call is aborted while the job
+is still being created, the job id never arrives and that job cannot be
+cancelled.
+
+Errors thrown after the job was created are never marked retryable, because the
+AI SDK retries by running the whole call again, which would create and bill a
+second job.
+
 Audio can also be passed as a URL. Speechmatics fetches `http` and `https` URLs
 itself, so large files are not downloaded into your process.
 
@@ -57,8 +73,8 @@ Pass these under `providerOptions.speechmatics`:
 | `diarization` | `none`, `speaker` or `channel`. Speaker turns are returned in `providerMetadata.speechmatics.utterances`. |
 | `additionalVocab` | Custom words, with optional `soundsLike` pronunciations. |
 | `enableEntities` | Include entities such as dates and numbers. They are returned in `providerMetadata.speechmatics.entities`. |
-| `pollingIntervalMs` | How often to check job status. Defaults to 5000. |
-| `timeoutMs` | How long to wait for the job. Defaults to 15 minutes. |
+| `pollingIntervalMs` | How often to check job status after the initial wait. Defaults to 5000. |
+| `timeoutMs` | Time limit for the job to finish, including the initial wait. Defaults to 15 minutes. When it runs out a running job is cancelled and an error is thrown. Downloading the transcript of a finished job is not cut short. |
 
 ## Models
 
