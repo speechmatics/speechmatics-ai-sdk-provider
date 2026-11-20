@@ -1,6 +1,6 @@
 {
   "name": "@speechmatics/ai-sdk-provider",
-  "version": "0.0.0",
+  "version": "0.1.0-beta.0",
   "description": "Speechmatics speech-to-text provider for the Vercel AI SDK",
   "license": "MIT",
   "type": "module",
@@ -49,7 +49,8 @@
     "test": "npm run test:node && npm run test:edge",
     "test:node": "vitest --config vitest.node.config.js --run",
     "test:edge": "vitest --config vitest.edge.config.js --run",
-    "test:watch": "vitest --config vitest.node.config.js --watch"
+    "test:watch": "vitest --config vitest.node.config.js --watch",
+    "prepublishOnly": "npm run type-check && npm test && npm run build"
   },
   "dependencies": {
     "@ai-sdk/provider": "^4.0.39",
