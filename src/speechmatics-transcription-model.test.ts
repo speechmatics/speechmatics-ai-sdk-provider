@@ -498,33 +498,6 @@ describe('SpeechmaticsTranscriptionModel models and warnings', () => {
     expect(enhanced.result.warnings).toEqual([]);
   });
 
-  it('warns when polling is needed but the interval cannot fit inside the timeout', async () => {
-    const { fetch } = createMockFetch({ jobStatuses: [doneJob] });
-    const result = await generate(fetch, {
-      pollingIntervalMs: 2_000,
-      timeoutMs: 2_000,
-    });
-
-    expect(result.warnings).toHaveLength(1);
-    expect(result.warnings[0]).toMatchObject({ type: 'other' });
-    expect((result.warnings[0] as { message: string }).message).toContain(
-      'pollingIntervalMs',
-    );
-  });
-
-  it('does not warn about the interval when the job finished during creation', async () => {
-    const { fetch } = createMockFetch({
-      createResponse: () =>
-        jsonResponse({ id: 'job-1', status: 'done', 'json-v2': transcript }, 201),
-    });
-    const result = await generate(fetch, {
-      pollingIntervalMs: 2_000,
-      timeoutMs: 2_000,
-    });
-
-    expect(result.warnings).toEqual([]);
-  });
-
   it('warns that a timeout under two seconds skips the initial wait', async () => {
     const { fetch, calls } = createMockFetch();
     const result = await generate(fetch, { timeoutMs: 500 });
@@ -936,11 +909,49 @@ describe('SpeechmaticsTranscriptionModel cancelling and time limits', () => {
     expect(error.message).toContain('could not be cancelled');
   });
 
-  it('returns the transcript if the job finished while we were giving up', async () => {
-    // The interval is longer than the timeout, so time is always up after the
-    // first poll. The check inside cancelling then sees `done`.
+  it('checks again at the deadline instead of giving up early when the interval is longer than the time left', async () => {
     const { fetch, calls } = createMockFetch({
       jobStatuses: [runningJob, doneJob],
+    });
+
+    const started = Date.now();
+    const result = await generate(fetch, {
+      timeoutMs: 50,
+      pollingIntervalMs: 10_000,
+    });
+
+    expect(result.text).toBe('Hello, world. How are you?');
+    // slept for what was left of the 50ms: not the 10s interval, and not zero
+    expect(Date.now() - started).toBeGreaterThanOrEqual(45);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(requests(calls)).toEqual([
+      'POST /v2/jobs',
+      'GET /v2/jobs/job-1',
+      'GET /v2/jobs/job-1',
+      'GET /v2/jobs/job-1/transcript',
+    ]);
+  });
+
+  it('does not time out while there is time left, even with a long interval', async () => {
+    const { fetch, calls } = createMockFetch({ jobStatuses: [runningJob] });
+
+    const started = Date.now();
+    const error = await generate(fetch, {
+      timeoutMs: 100,
+      pollingIntervalMs: 10_000,
+    }).catch((e: any) => e);
+
+    expect(error.message).toContain('did not finish within 100ms');
+    // the time limit was used up before it gave up
+    expect(Date.now() - started).toBeGreaterThanOrEqual(95);
+    expect(requests(calls)).toContain('DELETE /v2/jobs/job-1');
+  });
+
+  it('returns the transcript if the job finished while we were giving up', async () => {
+    // Still running at the last check at the deadline, done by the check
+    // inside cancelling.
+    const { fetch, calls } = createMockFetch({
+      jobStatuses: [runningJob, runningJob, doneJob],
     });
 
     const result = await generate(fetch, {
@@ -953,13 +964,15 @@ describe('SpeechmaticsTranscriptionModel cancelling and time limits', () => {
       'POST /v2/jobs',
       'GET /v2/jobs/job-1',
       'GET /v2/jobs/job-1',
+      'GET /v2/jobs/job-1',
       'GET /v2/jobs/job-1/transcript',
     ]);
   });
 
   it('reports a timeout, not the transient error, when time runs out during transient errors', async () => {
+    const failing = () => errorResponse(503);
     const { fetch } = createMockFetch({
-      jobStatuses: [() => errorResponse(503), runningJob],
+      jobStatuses: [failing, failing, runningJob],
     });
 
     const error = await generate(fetch, {

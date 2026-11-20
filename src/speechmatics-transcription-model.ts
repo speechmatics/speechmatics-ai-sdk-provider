@@ -384,14 +384,6 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
       }
     }
 
-    const remainingMs = deadline - Date.now();
-    if (pollingIntervalMs >= remainingMs) {
-      warnings.push({
-        type: 'other',
-        message: `pollingIntervalMs (${pollingIntervalMs}) is not smaller than the ${Math.max(0, remainingMs)}ms of timeoutMs left after job creation, so a job that is not finished is cancelled after one status check.`,
-      });
-    }
-
     const job = await this.waitForJob({
       id: created.id,
       headers,
@@ -507,6 +499,17 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
         cause,
       });
 
+    // Sleeps for the polling interval, or for what is left of the deadline if
+    // that is shorter, so there is always a last check at the deadline itself.
+    // Throws only once the deadline has passed.
+    const sleepUntilNextPoll = async (onTimeout: () => Error) => {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw onTimeout();
+      }
+      await delay(Math.min(pollingIntervalMs, remainingMs), { abortSignal });
+    };
+
     while (true) {
       let response;
       try {
@@ -529,10 +532,7 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
         ) {
           throw error;
         }
-        if (Date.now() + pollingIntervalMs > deadline) {
-          throw timedOut(error);
-        }
-        await delay(pollingIntervalMs, { abortSignal });
+        await sleepUntilNextPoll(() => timedOut(error));
         continue;
       }
       const { job } = response;
@@ -558,11 +558,7 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
         });
       }
 
-      if (Date.now() + pollingIntervalMs > deadline) {
-        throw timedOut();
-      }
-
-      await delay(pollingIntervalMs, { abortSignal });
+      await sleepUntilNextPoll(() => timedOut());
     }
   }
 
