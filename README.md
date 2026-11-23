@@ -3,19 +3,21 @@
 [Speechmatics](https://www.speechmatics.com) speech-to-text provider for the
 [Vercel AI SDK](https://ai-sdk.dev).
 
-> **Status: pre-release.** Batch transcription is implemented. Realtime
-> (streaming) transcription is planned and not yet available. This package is
-> not yet published to npm.
+> **Beta.** Batch transcription is available. Realtime (streaming)
+> transcription is not supported yet.
 
 ## Installation
 
 ```bash
-npm install @speechmatics/ai-sdk-provider ai
+npm install @speechmatics/ai-sdk-provider@beta ai
 ```
+
+Requires Node.js 22 or later.
 
 ## Authentication
 
-Set your API key as `SPEECHMATICS_API_KEY`, or pass it explicitly:
+Get an API key from the [Speechmatics portal](https://portal.speechmatics.com)
+and set it as `SPEECHMATICS_API_KEY`, or pass it explicitly:
 
 ```ts
 import { createSpeechmatics } from '@speechmatics/ai-sdk-provider';
@@ -42,39 +44,15 @@ const { text, segments } = await transcribe({
 });
 ```
 
-Short files finish in a single request: job creation waits up to 30 seconds for
-the result, or half of `timeoutMs` if that is less, so there is time left to
-poll. Longer jobs are then polled.
-
-If the call fails after the job was created, whether from an abort, a timeout or
-an error, the package checks the job. If it is still running, it is cancelled so
-it does not keep running and billing. If it finished after all, for example just
-as time ran out, its transcript is returned instead of an error. Cancelling is
-best effort and has its own 5 second limit. If the call is aborted while the job
-is still being created, the job id never arrives and that job cannot be
-cancelled.
-
-Errors thrown after the job was created are never marked retryable, because the
-AI SDK retries by running the whole call again, which would create and bill a
-second job.
-
 Audio can also be passed as a URL. Speechmatics fetches `http` and `https` URLs
 itself, so large files are not downloaded into your process.
 
-## Options
-
-Pass these under `providerOptions.speechmatics`:
-
-| Option | Description |
-| --- | --- |
-| `language` | Language code of the audio. Defaults to `en`, or `multi` for `melia-1`. |
-| `domain` | Specialised model for a field, e.g. `finance` or `medical`. |
-| `outputLocale` | Locale for the transcript output, e.g. `en-GB`. |
-| `diarization` | `none`, `speaker` or `channel`. Speaker turns are returned in `providerMetadata.speechmatics.utterances`. |
-| `additionalVocab` | Custom words, with optional `soundsLike` pronunciations. |
-| `enableEntities` | Include entities such as dates and numbers. They are returned in `providerMetadata.speechmatics.entities`. |
-| `pollingIntervalMs` | How often to check job status after the initial wait. Defaults to 5000. |
-| `timeoutMs` | Time limit for the job to finish, including the initial wait. Defaults to 15 minutes. When it runs out a running job is cancelled and an error is thrown. Downloading the transcript of a finished job is not cut short. |
+```ts
+const { text } = await transcribe({
+  model: speechmatics.transcription('enhanced'),
+  audio: new URL('https://example.com/meeting.mp3'),
+});
+```
 
 ## Models
 
@@ -92,6 +70,21 @@ Entity Detection, which this package does not expose yet. Passing
 
 Any other model name throws `NoSuchModelError`.
 
+## Options
+
+Pass these under `providerOptions.speechmatics`:
+
+| Option | Description |
+| --- | --- |
+| `language` | Language code of the audio. Defaults to `en`, or `multi` for `melia-1`. |
+| `domain` | Specialised model for a field, e.g. `finance` or `medical`. |
+| `outputLocale` | Locale for the transcript output, e.g. `en-GB`. |
+| `diarization` | `none`, `speaker` or `channel`. Speaker turns are returned in `providerMetadata.speechmatics.utterances`. |
+| `additionalVocab` | Custom words, with optional `soundsLike` pronunciations. |
+| `enableEntities` | Include entities such as dates and numbers. They are returned in `providerMetadata.speechmatics.entities`. |
+| `pollingIntervalMs` | How often to check whether a longer job has finished. Defaults to 5000. |
+| `timeoutMs` | Time limit for the whole call. Defaults to 15 minutes. |
+
 ## Extra results
 
 Speaker turns and entities do not fit the AI SDK result shape, so they are in
@@ -103,7 +96,22 @@ providerMetadata?.speechmatics;
 // { jobId, utterances: [{ speaker: 'S1', text, startSecond, endSecond }], entities: [...] }
 ```
 
+## Long audio, time limits and cancelling
+
+Short files are transcribed in a single request. Longer files are checked every
+`pollingIntervalMs` until they finish or `timeoutMs` runs out.
+
+If the call times out, is aborted, or fails after the job was created, a job that
+is still running is cancelled so it does not keep running. If it had finished in
+the meantime, you get the transcript instead of an error. When an error is
+thrown, its message says whether the job was cancelled.
+
+Errors thrown after the job was created are not retried automatically, because a
+retry would start a second job.
+
 ## Provider settings
+
+Pass these to `createSpeechmatics(...)`:
 
 | Setting | Description |
 | --- | --- |
@@ -111,17 +119,6 @@ providerMetadata?.speechmatics;
 | `baseURL` | Batch API base URL. Defaults to `https://asr.api.speechmatics.com`. |
 | `headers` | Extra headers to send with every request. |
 | `fetch` | Custom `fetch` implementation. |
-
-## Development
-
-```bash
-npm install
-npm run type-check
-npm test        # runs the suite on Node and in the Edge runtime
-npm run build
-```
-
-Node 24 is recommended (see `.nvmrc`).
 
 ## Licence
 
