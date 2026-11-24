@@ -5,23 +5,28 @@ import {
 } from '@ai-sdk/provider';
 import {
   loadApiKey,
+  resolve,
   resolveWith,
   withUserAgentSuffix,
   type FetchFunction,
   type Resolvable,
+  type WebSocketConstructor,
 } from '@ai-sdk/provider-utils';
+import { requestTemporaryKey } from './speechmatics-temporary-key';
 import { SpeechmaticsTranscriptionModel } from './speechmatics-transcription-model';
 import {
-  SPEECHMATICS_BATCH_MODEL_IDS,
+  SPEECHMATICS_REALTIME_MODEL_IDS,
   type SpeechmaticsTranscriptionModelId,
 } from './speechmatics-transcription-options';
 import { VERSION } from './version';
 
 const DEFAULT_BASE_URL = 'https://asr.api.speechmatics.com';
+const DEFAULT_REALTIME_BASE_URL = 'wss://global.rt.speechmatics.com';
 
 export interface SpeechmaticsProvider extends ProviderV4 {
   /**
    * Creates a model for transcription. Defaults to the `enhanced` model.
+   * `linden-1` supports streaming only.
    */
   transcription(
     modelId?: SpeechmaticsTranscriptionModelId,
@@ -49,6 +54,28 @@ export interface SpeechmaticsProviderSettings {
   baseURL?: string;
 
   /**
+   * Base URL for streaming transcription. Defaults to
+   * `wss://global.rt.speechmatics.com`, which routes to the nearest region. Use
+   * a regional host such as `wss://eu.rt.speechmatics.com` to keep data in one
+   * region.
+   */
+  realtimeBaseURL?: string;
+
+  /**
+   * Returns a temporary key for each streaming session. Use it in the browser,
+   * where the API key must not be exposed: fetch a key from your own server,
+   * which creates it with `createTemporaryKey`. When not set, the provider
+   * creates one from the API key.
+   */
+  getTemporaryKey?: (options: { abortSignal?: AbortSignal }) => Promise<string>;
+
+  /**
+   * Custom WebSocket implementation for streaming. Defaults to the global
+   * `WebSocket`.
+   */
+  webSocket?: WebSocketConstructor;
+
+  /**
    * Custom headers to include in the requests.
    */
   headers?: Record<string, string>;
@@ -67,6 +94,9 @@ export function createSpeechmatics(
   options: SpeechmaticsProviderSettings = {},
 ): SpeechmaticsProvider {
   const baseURL = (options.baseURL ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const realtimeBaseURL = (
+    options.realtimeBaseURL ?? DEFAULT_REALTIME_BASE_URL
+  ).replace(/\/+$/, '');
 
   const getHeaders = () =>
     resolveWith(options.apiKey, apiKey =>
@@ -88,11 +118,13 @@ export function createSpeechmatics(
   ) => {
     // The type already restricts this, but callers without type checking can
     // pass anything.
-    if (!(SPEECHMATICS_BATCH_MODEL_IDS as readonly string[]).includes(modelId)) {
+    if (
+      !(SPEECHMATICS_REALTIME_MODEL_IDS as readonly string[]).includes(modelId)
+    ) {
       throw new NoSuchModelError({
         modelId,
         modelType: 'transcriptionModel',
-        message: `Speechmatics batch transcription supports these models: ${SPEECHMATICS_BATCH_MODEL_IDS.join(', ')}. Got "${modelId}".`,
+        message: `Speechmatics transcription supports these models: ${SPEECHMATICS_REALTIME_MODEL_IDS.join(', ')}. Got "${modelId}".`,
       });
     }
 
@@ -101,6 +133,16 @@ export function createSpeechmatics(
       url: ({ path }) => `${baseURL}${path}`,
       headers: getHeaders,
       fetch: options.fetch,
+      realtimeUrl: ({ path }) => `${realtimeBaseURL}${path}`,
+      getTemporaryKey:
+        options.getTemporaryKey ??
+        (async ({ abortSignal }) =>
+          requestTemporaryKey({
+            headers: await resolve(getHeaders),
+            fetch: options.fetch,
+            abortSignal,
+          })),
+      webSocket: options.webSocket,
     });
   };
 

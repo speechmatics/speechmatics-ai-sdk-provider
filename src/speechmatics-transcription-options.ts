@@ -12,5 +12,17 @@ export const SPEECHMATICS_BATCH_MODEL_IDS = [
   'melia-1',
 ] as const;
 
+/**
+ * Models offered for streaming (realtime) transcription.
+ *
+ * - `enhanced`, `standard`, `melia-1`: the Realtime API, as for batch.
+ * - `linden-1`: the Agent STT API, built for voice agents. It returns
+ *   speaker-attributed segments and detects the end of each turn. Streaming only.
+ */
+export const SPEECHMATICS_REALTIME_MODEL_IDS = [
+  ...SPEECHMATICS_BATCH_MODEL_IDS,
+  'linden-1',
+] as const;
+
 export type SpeechmaticsTranscriptionModelId =
-  (typeof SPEECHMATICS_BATCH_MODEL_IDS)[number];
+  (typeof SPEECHMATICS_REALTIME_MODEL_IDS)[number];

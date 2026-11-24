@@ -50,13 +50,33 @@ export const speechmaticsTranscriptionModelOptionsSchema = lazySchema(() =>
       enableEntities: z.boolean().optional(),
 
       /**
-       * How often to check whether the job has finished, in milliseconds.
-       * Defaults to 5000.
+       * Streaming only. Send non-final results as `transcript-partial` parts.
+       * Defaults to true.
+       */
+      enablePartials: z.boolean().optional(),
+
+      /**
+       * Streaming only, not on `linden-1`. Longest delay in seconds before a
+       * final result, from 0.7 to 4. Lower is faster but less accurate.
+       * Defaults to 4.
+       */
+      maxDelay: z.number().min(0.7).max(4).optional(),
+
+      /**
+       * Streaming only, `enhanced` and `standard` only. Seconds of silence,
+       * from 0 to 2, after which an `EndOfUtterance` message is sent. 0 or
+       * unset turns it off.
+       */
+      endOfUtteranceSilenceTrigger: z.number().min(0).max(2).optional(),
+
+      /**
+       * Batch only. How often to check whether the job has finished, in
+       * milliseconds. Defaults to 5000.
        */
       pollingIntervalMs: z.number().int().positive().optional(),
 
       /**
-       * Time limit for the job to finish, in milliseconds. It covers the
+       * Batch only. Time limit for the job to finish, in milliseconds. It covers the
        * initial wait and polling, but does not cut short the transcript
        * download of a finished job. Defaults to 15 minutes. When it runs out, a
        * running job is cancelled and an error is thrown.

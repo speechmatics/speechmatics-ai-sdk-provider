@@ -8,7 +8,12 @@ export type SpeechmaticsResultItem = {
   is_eos?: boolean | null;
   attaches_to?: string | null;
   entity_class?: string | null;
-  alternatives?: Array<{ content: string; speaker?: string | null }> | null;
+  alternatives?: Array<{
+    content: string;
+    speaker?: string | null;
+    confidence?: number | null;
+    language?: string | null;
+  }> | null;
 };
 
 type Timed = { startSecond: number; endSecond: number };

@@ -17,14 +17,19 @@ describe('createSpeechmatics', () => {
     expect(provider.transcriptionModel!('standard').modelId).toBe('standard');
   });
 
-  it('accepts exactly the three batch models', () => {
-    for (const modelId of ['enhanced', 'standard', 'melia-1'] as const) {
+  it('accepts the three batch models and linden-1', () => {
+    for (const modelId of [
+      'enhanced',
+      'standard',
+      'melia-1',
+      'linden-1',
+    ] as const) {
       expect(provider.transcription(modelId).modelId).toBe(modelId);
     }
   });
 
-  it('rejects models that are not offered for batch, including oak-1', () => {
-    for (const modelId of ['oak-1', 'linden-1', 'nonsense']) {
+  it('rejects models that are not offered, including oak-1 and linden-2', () => {
+    for (const modelId of ['oak-1', 'linden-2', 'nonsense']) {
       expect(() => provider.transcription(modelId as 'enhanced')).toThrow(
         NoSuchModelError,
       );

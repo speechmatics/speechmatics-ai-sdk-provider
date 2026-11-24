@@ -1,4 +1,7 @@
-import { APICallError } from '@ai-sdk/provider';
+import {
+  APICallError,
+  UnsupportedFunctionalityError,
+} from '@ai-sdk/provider';
 import type { SharedV4Warning, TranscriptionModelV4 } from '@ai-sdk/provider';
 import {
   combineHeaders,
@@ -24,8 +27,12 @@ import type {
 } from './speechmatics-api-types';
 import type { SpeechmaticsConfig } from './speechmatics-config';
 import { speechmaticsFailedResponseHandler } from './speechmatics-error';
+import { streamSpeechmaticsTranscription } from './speechmatics-streaming-transcription';
 import { speechmaticsTranscriptionModelOptionsSchema } from './speechmatics-transcription-model-options';
-import type { SpeechmaticsTranscriptionModelId } from './speechmatics-transcription-options';
+import {
+  SPEECHMATICS_BATCH_MODEL_IDS,
+  type SpeechmaticsTranscriptionModelId,
+} from './speechmatics-transcription-options';
 import { buildTranscript } from './speechmatics-transcript';
 
 const DEFAULT_LANGUAGE = 'en';
@@ -79,6 +86,16 @@ type GenerateResult = Awaited<ReturnType<TranscriptionModelV4['doGenerate']>>;
 type GenerateFromUrlOptions = Parameters<
   NonNullable<TranscriptionModelV4['doGenerateFromUrl']>
 >[0];
+type StreamOptions = Parameters<NonNullable<TranscriptionModelV4['doStream']>>[0];
+type StreamResult = Awaited<
+  ReturnType<NonNullable<TranscriptionModelV4['doStream']>>
+>;
+
+const STREAMING_ONLY_OPTIONS = [
+  'enablePartials',
+  'maxDelay',
+  'endOfUtteranceSilenceTrigger',
+] as const;
 
 export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
   readonly specificationVersion = 'v4';
@@ -167,6 +184,15 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
         message: `On ${this.modelId}, Speechmatics only accepts enable_entities together with Entity Detection (entities_config.detect_advanced_entities), which this provider does not set. The job may be rejected.`,
       });
     }
+    for (const key of STREAMING_ONLY_OPTIONS) {
+      if (options?.[key] != null) {
+        warnings.push({
+          type: 'unsupported',
+          feature: `providerOptions.speechmatics.${key}`,
+          details: 'This option only applies to streaming transcription.',
+        });
+      }
+    }
     if (timeoutMs < 2_000) {
       warnings.push({
         type: 'other',
@@ -186,6 +212,8 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
   }
 
   async doGenerate(options: GenerateOptions): Promise<GenerateResult> {
+    this.assertBatchModel();
+
     const bytes =
       typeof options.audio === 'string'
         ? convertBase64ToUint8Array(options.audio)
@@ -204,6 +232,8 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
   async doGenerateFromUrl(
     options: GenerateFromUrlOptions,
   ): Promise<GenerateResult | undefined> {
+    this.assertBatchModel();
+
     // Speechmatics fetches http(s) URLs itself. Anything else (data: URLs and
     // so on) falls back to the SDK downloading the audio and calling doGenerate.
     if (
@@ -214,6 +244,21 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
     }
 
     return this.runJob(options, new FormData(), options.audio.toString());
+  }
+
+  async doStream(options: StreamOptions): Promise<StreamResult> {
+    return streamSpeechmaticsTranscription(this.modelId, this.config, options);
+  }
+
+  private assertBatchModel() {
+    if (
+      !(SPEECHMATICS_BATCH_MODEL_IDS as readonly string[]).includes(this.modelId)
+    ) {
+      throw new UnsupportedFunctionalityError({
+        functionality: `batch transcription with ${this.modelId}`,
+        message: `${this.modelId} only supports streaming transcription. Use experimental_streamTranscribe, or one of these models for batch: ${SPEECHMATICS_BATCH_MODEL_IDS.join(', ')}.`,
+      });
+    }
   }
 
   private async runJob(
