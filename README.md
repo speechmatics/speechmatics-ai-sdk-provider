@@ -13,7 +13,17 @@
 npm install @speechmatics/ai-sdk-provider@beta ai
 ```
 
-Requires Node.js 22 or later.
+Requires `ai` 7 or later. On the server, requires Node.js 22 or later. Streaming
+also runs in the browser; see [Streaming in the browser](#streaming-in-the-browser).
+
+## Skill for Coding Agents
+
+If you use coding agents such as Claude Code or Cursor, add the AI SDK skill to
+your repository:
+
+```bash
+npx skills add vercel/ai
+```
 
 ## Authentication
 
@@ -44,6 +54,9 @@ const { text, segments } = await transcribe({
   },
 });
 ```
+
+Batch accepts wav, mp3, aac, ogg, mpeg, amr, m4a, mp4 and flac files. See
+[supported file types](https://docs.speechmatics.com/speech-to-text/batch/input#supported-file-types).
 
 Audio can also be passed as a URL. Speechmatics fetches `http` and `https` URLs
 itself, so large files are not downloaded into your process.
@@ -82,29 +95,97 @@ for await (const part of result.fullStream) {
 console.log(await result.text);
 ```
 
-Audio must be raw:
+Audio must be raw, in one of these formats:
 
-- `audio/pcm`: 16-bit little-endian PCM, at any sample rate.
-- `audio/pcmu`: µ-law. Not supported by `linden-1`.
+- `audio/pcm`: 16-bit little-endian PCM.
+- `audio/pcmu`: G.711 µ-law, as used in telephony.
+- `audio/pcma`: G.711 A-law.
 
-`linden-1` accepts 8000 or 16000 Hz only. Other formats throw
-`InvalidArgumentError` before connecting.
+Every model accepts all three. `enhanced`, `standard` and `melia-1` accept any
+sample rate; `linden-1` accepts 8000 or 16000 Hz only. Audio is not resampled,
+so `rate` must be the real sample rate of the audio. Other formats and rates
+throw `InvalidArgumentError` before connecting. Chunks can be `Uint8Array`s or
+base64 strings.
 
 Results arrive as `transcript-partial` parts, which later parts may revise, and
 `transcript-final` parts, which are settled. Set `enablePartials: false` to get
 final results only.
 
-- With `enhanced`, `standard` and `melia-1`, each final part carries its words
-  in `providerMetadata.speechmatics.words`, with timings, confidence and, with
-  diarization, the speaker.
-- With `linden-1`, each part is a segment with its speaker in
-  `providerMetadata.speechmatics.speaker`. A final part that ends the speaker's
-  turn has `endOfTurn: true`, which is the cue for a voice agent to respond.
+Each part has `text` and `startSecond`. Partials add `durationInSeconds`, and
+finals add `endSecond`. All times are in seconds from the start of the audio.
+`providerMetadata.speechmatics` depends on the model:
 
-When the stream finishes, `providerMetadata.speechmatics` holds the session id,
-speaker turns (`utterances`) and any warnings Speechmatics sent during the
-session. Pass `includeRawChunks: true` to also receive every Speechmatics
-message as a `raw` part, including turn and utterance events.
+```ts
+// enhanced, standard and melia-1: final parts only
+{
+  words: [
+    {
+      text: 'Hello',
+      startSecond: 0.5,
+      endSecond: 0.82,
+      confidence: 0.99,
+      speaker: 'S1', // with diarization: 'speaker'
+      language: 'en', // melia-1 only
+    },
+  ],
+  endOfUtterance: true, // when endOfUtteranceSilenceTrigger is above 0
+}
+
+// linden-1: partial and final parts, each one segment of speech
+{
+  speaker: 'S1', // with diarization: 'speaker'
+  startOfTurn: true, // first part of a turn only
+  endOfTurn: true, // final parts only
+}
+```
+
+The AI SDK types provider metadata as plain JSON. Cast it to the exported types
+to read it:
+
+```ts
+import type { SpeechmaticsStreamPartMetadata } from '@speechmatics/ai-sdk-provider';
+
+const metadata = part.providerMetadata?.speechmatics as
+  | SpeechmaticsStreamPartMetadata
+  | undefined;
+```
+
+The flags mark turns and utterances:
+
+| Flag | Model | On | Meaning |
+| --- | --- | --- | --- |
+| `startOfTurn` | `linden-1` | The first part of a turn, partial or final | Someone has started speaking. Use it to interrupt a voice agent that is talking. Only present when `true`. Arrives with the first partial, so keep `enablePartials` on (the default) when you use it for interruptions. |
+| `endOfTurn` | `linden-1` | Every final part | `true` when the part ends the speaker's turn, the cue for a voice agent to respond. |
+| `endOfUtterance` | `enhanced`, `standard` | Every final part, when `endOfUtteranceSilenceTrigger` is above 0 | `true` when the part is followed by the set length of silence. |
+
+To set these flags, a final part is held for up to 50 ms until Speechmatics
+confirms whether the turn or utterance ended. `melia-1` final parts, and
+`enhanced` and `standard` final parts unless `endOfUtteranceSilenceTrigger` is
+above 0, are not held and carry no flag.
+
+When the stream finishes, `result.providerMetadata` holds the session id, speaker
+turns and any warnings Speechmatics sent; see [Extra results](#extra-results).
+Pass `includeRawChunks: true` to also receive every Speechmatics message as a
+`raw` part, including turn and utterance events.
+
+### Errors, cancelling and limits
+
+- If Speechmatics rejects the session or reports an error, the stream errors:
+  iterating `fullStream` throws, and `result.text` and the other promises
+  reject. The message includes Speechmatics' error type and reason, e.g.
+  `Speechmatics streaming error (protocol_error): ...`.
+- If the connection closes before the transcript finishes, the stream errors
+  with the close code and reason.
+- If no speech is recognised, the AI SDK ends the stream with
+  `NoTranscriptGeneratedError`, both when iterating `fullStream` and from
+  `result.text`.
+- To stop a session, pass an `abortSignal` or stop reading `fullStream` (e.g.
+  `break` out of the loop). The connection is closed straight away.
+- Options a model does not support are left out of the request, and listed in
+  `await result.warnings`. See [Options](#options).
+- Each open session counts towards your account's
+  [limit on concurrent sessions](https://docs.speechmatics.com/speech-to-text/realtime/limits).
+  Close sessions you no longer need.
 
 ### Streaming in the browser
 
@@ -117,10 +198,27 @@ instead:
 // On your server, e.g. an API route
 import { createTemporaryKey } from '@speechmatics/ai-sdk-provider';
 
-export async function POST() {
+export async function POST(request: Request) {
+  // Replace with your own sign-in check.
+  if (!(await isSignedIn(request))) {
+    return new Response('Unauthorized', { status: 401 });
+  }
   return Response.json({ key: await createTemporaryKey() });
 }
 ```
+
+Always check who is asking before you return a key. Anyone who gets a key can
+transcribe on your account, and an open route lets anyone ask for a new key
+whenever the last one expires.
+
+A key can start any number of sessions until it expires, and sessions it starts
+keep running after that. `createTemporaryKey({ ttl })` sets its lifetime in
+seconds, from 60 to 86400. Keep it short: the key only needs to last until the
+session starts. A key works with every model and region, including a regional
+`realtimeBaseURL`.
+
+On the server, the provider creates a key the same way before each session.
+This adds one HTTPS request, about 30 ms, before the connection opens.
 
 ```ts
 // In the browser
@@ -137,6 +235,8 @@ const speechmatics = createSpeechmatics({
 ## Models
 
 Pass the model to `speechmatics.transcription(...)`. The default is `enhanced`.
+See [Models](https://docs.speechmatics.com/speech-to-text/models) in the
+Speechmatics docs for details.
 
 | Model | Batch | Streaming | Use it for |
 | --- | --- | --- | --- |
@@ -144,17 +244,6 @@ Pass the model to `speechmatics.transcription(...)`. The default is `enhanced`.
 | `standard` | Yes | Yes | Lower latency and higher throughput. |
 | `melia-1` | Yes | Yes | Audio with more than one language. |
 | `linden-1` | No | Yes | Voice agents: fast results, speaker segments and end-of-turn detection. |
-
-`melia-1` does not support custom vocabulary, and accepts entities only with
-Entity Detection, which this package does not expose yet. Passing
-`additionalVocab` or `enableEntities` with it returns a warning.
-
-Options a model does not support for streaming are left out of the request,
-with a warning:
-
-- `melia-1`: `domain`, `additionalVocab`, `enableEntities`, `maxDelay`,
-  `endOfUtteranceSilenceTrigger`.
-- `linden-1`: `enableEntities`, `maxDelay`, `endOfUtteranceSilenceTrigger`.
 
 Using `linden-1` with `transcribe` throws `UnsupportedFunctionalityError`. Any
 other model name throws `NoSuchModelError`.
@@ -165,27 +254,68 @@ Pass these under `providerOptions.speechmatics`:
 
 | Option | Description |
 | --- | --- |
-| `language` | Language code of the audio. Defaults to `en`, or `multi` for `melia-1`. |
-| `domain` | Specialised model for a field, e.g. `finance` or `medical`. |
-| `outputLocale` | Locale for the transcript output, e.g. `en-GB`. |
-| `diarization` | `none`, `speaker` or `channel` (batch only). Speaker turns are returned in `providerMetadata.speechmatics.utterances`. |
-| `additionalVocab` | Custom words, with optional `soundsLike` pronunciations. |
+| `language` | [Language code](https://docs.speechmatics.com/speech-to-text/languages) of the audio. Defaults to `en`, or `multi` for `melia-1`. |
+| `domain` | Specialised model, e.g. [`medical`](https://docs.speechmatics.com/speech-to-text/models#healthcare-domain), or `bilingual-en` for [Spanish and English](https://docs.speechmatics.com/speech-to-text/languages#bilingual-and-multi-language-packs) with `language: 'es'`. |
+| `outputLocale` | [Locale for the transcript output](https://docs.speechmatics.com/speech-to-text/formatting#output-locale), e.g. `en-GB`. |
+| `diarization` | [Diarization](https://docs.speechmatics.com/speech-to-text/features/diarization): `none`, `speaker` or `channel`. Speaker turns are returned in `providerMetadata.speechmatics.utterances`. |
+| `additionalVocab` | [Custom words](https://docs.speechmatics.com/speech-to-text/features/custom-dictionary), with optional `soundsLike` pronunciations. |
 | `enableEntities` | Include entities such as dates and numbers. They are returned in `providerMetadata.speechmatics.entities`. |
-| `enablePartials` | Streaming only. Send non-final results. Defaults to `true`. |
-| `maxDelay` | Streaming only. Longest wait in seconds for a final result, from 0.7 to 4. Lower is faster but less accurate. Defaults to 4. |
-| `endOfUtteranceSilenceTrigger` | Streaming only, `enhanced` and `standard`. Seconds of silence, up to 2, after which Speechmatics sends an `EndOfUtterance` message. |
-| `pollingIntervalMs` | Batch only. How often to check whether a longer job has finished. Defaults to 5000. |
-| `timeoutMs` | Batch only. Time limit for the whole call. Defaults to 15 minutes. |
+| `enablePartials` | Send non-final results. Defaults to `true`. |
+| `maxDelay` | Longest wait in seconds for a final result, from 0.7 to 4. Lower is faster but less accurate. Defaults to 4. |
+| `endOfUtteranceSilenceTrigger` | Seconds of silence, up to 2, after which an [utterance ends](https://docs.speechmatics.com/speech-to-text/realtime/turn-detection). Above 0, it turns on the `endOfUtterance` flag. |
+| `pollingIntervalMs` | How often to check whether a longer job has finished, in milliseconds. Defaults to 5000. |
+| `timeoutMs` | Time limit for the whole call, in milliseconds. Defaults to 15 minutes. |
+
+Not every option works everywhere. An option that does not apply is left out of
+the request, and a warning is added to `result.warnings`:
+
+| Option | Batch: `enhanced`, `standard`, `melia-1` | Streaming: `enhanced`, `standard` | Streaming: `melia-1` | Streaming: `linden-1` |
+| --- | --- | --- | --- | --- |
+| `language` | ✓ | ✓ | ✓ | ✓ |
+| `domain` | ✓ | ✓ | ✗ | ✓ |
+| `outputLocale` | ✓ | ✓ | ✓ | ✓ |
+| `diarization` | ✓ | `speaker` only | `speaker` only | `speaker` only |
+| `additionalVocab` | ✓, not `melia-1`¹ | ✓ | ✗ | ✓ |
+| `enableEntities` | ✓, not `melia-1`¹ | ✓ | ✗ | ✗ |
+| `enablePartials` | ✗ | ✓ | ✓ | ✓ |
+| `maxDelay` | ✗ | ✓ | ✗ | ✗ |
+| `endOfUtteranceSilenceTrigger` | ✗ | ✓ | ✗ | ✗ |
+| `pollingIntervalMs` | ✓ | ✗ | ✗ | ✗ |
+| `timeoutMs` | ✓ | ✗ | ✗ | ✗ |
+
+¹ In batch, `additionalVocab` and `enableEntities` are still sent with
+`melia-1`, with a warning: Speechmatics may reject the job or ignore them.
+`melia-1` does not support custom vocabulary, and accepts entities only with
+Entity Detection, which this package does not expose yet.
 
 ## Extra results
 
 Speaker turns and entities do not fit the AI SDK result shape, so they are in
-`providerMetadata.speechmatics`. All times are in seconds.
+`providerMetadata.speechmatics`. All times are in seconds. Cast it to
+`SpeechmaticsTranscriptionMetadata` (batch) or `SpeechmaticsStreamMetadata`
+(streaming) to read it.
 
 ```ts
+// Batch: transcribe()
 const { providerMetadata } = await transcribe({ /* ... */ });
 providerMetadata?.speechmatics;
-// { jobId, utterances: [{ speaker: 'S1', text, startSecond, endSecond }], entities: [...] }
+// {
+//   jobId: 'r6c9cmmpdr',
+//   utterances: [{ speaker: 'S1', text, startSecond, endSecond }], // with diarization
+//   entities: [{ entityClass: 'date', text, startSecond, endSecond }], // with enableEntities
+// }
+
+// Streaming: experimental_streamTranscribe()
+const result = streamTranscribe({ /* ... */ });
+await result.providerMetadata;
+// {
+//   speechmatics: {
+//     sessionId: '56cbf3b6-a2da-4083-aa23-f7f356c1899b',
+//     utterances: [{ speaker: 'S1', text, startSecond, endSecond }], // with diarization
+//     entities: [...], // with enableEntities
+//     warnings: [...], // Warning messages Speechmatics sent during the session
+//   },
+// }
 ```
 
 ## Long audio, time limits and cancelling (batch)
@@ -214,6 +344,36 @@ Pass these to `createSpeechmatics(...)`:
 | `webSocket` | Custom `WebSocket` implementation for streaming. |
 | `headers` | Extra headers to send with every request. |
 | `fetch` | Custom `fetch` implementation. |
+
+## Examples
+
+[`examples/`](examples) has two scripts that run against the Speechmatics API:
+
+- [`transcribe.mjs`](examples/transcribe.mjs) transcribes a file or URL in
+  batch.
+- [`stream-transcribe.mjs`](examples/stream-transcribe.mjs) streams a 16-bit
+  PCM WAV file at real time, as a microphone would, and prints partials,
+  finals and turn flags as they arrive.
+
+To run them from a clone of this repository:
+
+```bash
+npm install
+npm install --no-save ai@7
+npm run build
+SPEECHMATICS_API_KEY=... node examples/transcribe.mjs meeting.mp3 en enhanced
+SPEECHMATICS_API_KEY=... node examples/stream-transcribe.mjs call.wav linden-1
+```
+
+## Speechmatics API reference
+
+- [Realtime API](https://docs.speechmatics.com/api-ref/realtime-transcription-websocket),
+  used by `enhanced`, `standard` and `melia-1` when streaming.
+- [Agent STT API](https://docs.speechmatics.com/api-ref/agent-stt-websocket),
+  used by `linden-1`. See also the
+  [Agent STT overview](https://docs.speechmatics.com/speech-to-text/agent-stt/).
+- [Batch API](https://docs.speechmatics.com/api-ref/batch/create-a-new-job),
+  used by `transcribe`.
 
 ## Licence
 

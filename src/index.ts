@@ -5,6 +5,14 @@ export type {
 } from './speechmatics-provider';
 export { SpeechmaticsTranscriptionModel } from './speechmatics-transcription-model';
 export type { SpeechmaticsTranscriptionModelOptions } from './speechmatics-transcription-model-options';
+export type {
+  SpeechmaticsEntity,
+  SpeechmaticsStreamMetadata,
+  SpeechmaticsStreamPartMetadata,
+  SpeechmaticsTranscriptionMetadata,
+  SpeechmaticsUtterance,
+  SpeechmaticsWord,
+} from './speechmatics-provider-metadata';
 export { createTemporaryKey } from './speechmatics-temporary-key';
 export {
   SPEECHMATICS_BATCH_MODEL_IDS,

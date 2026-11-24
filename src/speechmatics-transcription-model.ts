@@ -33,6 +33,7 @@ import {
   SPEECHMATICS_BATCH_MODEL_IDS,
   type SpeechmaticsTranscriptionModelId,
 } from './speechmatics-transcription-options';
+import type { SpeechmaticsTranscriptionMetadata } from './speechmatics-provider-metadata';
 import { buildTranscript } from './speechmatics-transcript';
 
 const DEFAULT_LANGUAGE = 'en';
@@ -386,7 +387,7 @@ export class SpeechmaticsTranscriptionModel implements TranscriptionModelV4 {
           jobId: created.id,
           ...(utterances != null ? { utterances } : {}),
           ...(entities != null ? { entities } : {}),
-        },
+        } satisfies SpeechmaticsTranscriptionMetadata,
       },
     };
   }

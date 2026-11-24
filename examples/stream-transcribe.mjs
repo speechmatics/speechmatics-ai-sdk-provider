@@ -36,17 +36,34 @@ const result = streamTranscribe({
   model: speechmatics.transcription(model),
   audio,
   inputAudioFormat: { type: 'audio/pcm', rate },
-  providerOptions: { speechmatics: { diarization: 'speaker' } },
+  providerOptions: {
+    speechmatics: {
+      diarization: 'speaker',
+      // Marks final parts followed by 0.5 s of silence. enhanced and standard only.
+      ...(['enhanced', 'standard'].includes(model)
+        ? { endOfUtteranceSilenceTrigger: 0.5 }
+        : {}),
+    },
+  },
 });
 
 for await (const part of result.fullStream) {
   if (part.type === 'transcript-partial') {
+    if (part.providerMetadata?.speechmatics?.startOfTurn) {
+      console.log('\r[start of turn]'.padEnd(104));
+    }
     process.stdout.write(`\r… ${part.text.slice(-100)}`.padEnd(104));
   }
   if (part.type === 'transcript-final') {
-    const { speaker, endOfTurn } = part.providerMetadata?.speechmatics ?? {};
+    const { speaker, startOfTurn, endOfTurn, endOfUtterance } =
+      part.providerMetadata?.speechmatics ?? {};
+    const marks = [
+      startOfTurn && '[start of turn]',
+      endOfTurn && '[end of turn]',
+      endOfUtterance && '[end of utterance]',
+    ].filter(Boolean);
     console.log(
-      `\r${part.startSecond.toFixed(2)}s ${speaker ?? ''} ${part.text}${endOfTurn ? '  [end of turn]' : ''}`.padEnd(104),
+      `\r${part.startSecond.toFixed(2)}s ${speaker ?? ''} ${part.text}${marks.length ? ' ' + marks.join(' ') : ''}`.padEnd(104),
     );
   }
 }

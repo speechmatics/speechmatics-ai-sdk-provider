@@ -7,7 +7,6 @@
 import {
   InvalidArgumentError,
   type Experimental_TranscriptionModelV4StreamPart as TranscriptionModelV4StreamPart,
-  type JSONObject,
   type SharedV4Warning,
   type TranscriptionModelV4,
 } from '@ai-sdk/provider';
@@ -24,7 +23,14 @@ import {
   type WebSocketLike,
 } from '@ai-sdk/provider-utils';
 import { z } from 'zod/v4';
+import { decodeAlaw, decodeMulaw } from './g711';
 import type { SpeechmaticsConfig } from './speechmatics-config';
+import type {
+  SpeechmaticsStreamMetadata,
+  SpeechmaticsStreamPartMetadata,
+  SpeechmaticsUtterance,
+  SpeechmaticsWord,
+} from './speechmatics-provider-metadata';
 import {
   buildTranscript,
   type SpeechmaticsResultItem,
@@ -67,15 +73,33 @@ const UNSUPPORTED_OPTIONS: Record<
   'linden-1': ['enableEntities', 'maxDelay', 'endOfUtteranceSilenceTrigger'],
 };
 
-// Agent STT sends `EndOfTurn` straight after the segment that closes the turn.
-// A final segment is held this long so it can be marked `endOfTurn`.
-const END_OF_TURN_WAIT_MS = 100;
+// Agent STT sends `EndOfTurn`, and Realtime sends `EndOfUtterance`, straight
+// after the final result that closes the turn or utterance. A final is held
+// until the next result or this long, so it can be marked `endOfTurn` or
+// `endOfUtterance`.
+const FINAL_HOLD_MS = 50;
 
-const ENCODINGS: Record<string, { encoding: string; bytesPerSample: number }> =
+// `encoding` is what the Realtime API accepts natively; Agent STT accepts
+// `pcm_s16le` only. Anything else is decoded to `pcm_s16le` before sending.
+const INPUT_FORMATS: Record<
+  string,
   {
-    'audio/pcm': { encoding: 'pcm_s16le', bytesPerSample: 2 },
-    'audio/pcmu': { encoding: 'mulaw', bytesPerSample: 1 },
-  };
+    bytesPerSample: number;
+    encoding?: 'pcm_s16le' | 'mulaw';
+    decode?: (bytes: Uint8Array) => Uint8Array;
+  }
+> = {
+  'audio/pcm': { bytesPerSample: 2, encoding: 'pcm_s16le' },
+  'audio/pcmu': { bytesPerSample: 1, encoding: 'mulaw', decode: decodeMulaw },
+  'audio/pcma': { bytesPerSample: 1, decode: decodeAlaw },
+};
+
+const TRANSCRIPT_MESSAGES = [
+  'AddPartialTranscript',
+  'AddTranscript',
+  'AddPartialSegment',
+  'AddSegment',
+];
 
 type Segment = { text: string; startSecond: number; endSecond: number };
 
@@ -87,12 +111,12 @@ export async function streamSpeechmaticsTranscription(
   const agent = modelId === AGENT_MODEL;
   const multilingual = modelId === MULTILINGUAL_MODEL;
 
-  const format = ENCODINGS[options.inputAudioFormat.type];
+  const format = INPUT_FORMATS[options.inputAudioFormat.type];
   const rate = options.inputAudioFormat.rate;
   if (format == null) {
     throw new InvalidArgumentError({
       argument: 'inputAudioFormat',
-      message: `Speechmatics streaming supports audio/pcm (16-bit little-endian) and audio/pcmu. Got ${options.inputAudioFormat.type}.`,
+      message: `Speechmatics streaming supports audio/pcm (16-bit little-endian), audio/pcmu and audio/pcma. Got ${options.inputAudioFormat.type}.`,
     });
   }
   if (rate == null || !Number.isInteger(rate) || rate <= 0) {
@@ -102,18 +126,16 @@ export async function streamSpeechmaticsTranscription(
         'Speechmatics streaming requires a positive integer sample rate.',
     });
   }
-  if (agent && format.encoding !== 'pcm_s16le') {
-    throw new InvalidArgumentError({
-      argument: 'inputAudioFormat',
-      message: `${modelId} supports audio/pcm only.`,
-    });
-  }
   if (agent && !AGENT_SAMPLE_RATES.includes(rate)) {
     throw new InvalidArgumentError({
       argument: 'inputAudioFormat',
-      message: `${modelId} supports sample rates of ${AGENT_SAMPLE_RATES.join(' or ')} Hz. Got ${rate}.`,
+      message: `${modelId} supports audio/pcm, audio/pcmu and audio/pcma at sample rates of ${AGENT_SAMPLE_RATES.join(' or ')} Hz. Got ${rate}.`,
     });
   }
+  const sendsNative =
+    format.encoding === 'pcm_s16le' || (!agent && format.encoding != null);
+  const encoding = sendsNative ? format.encoding! : 'pcm_s16le';
+  const decode = sendsNative ? undefined : format.decode!;
 
   const providerOptions = await parseProviderOptions({
     provider: 'speechmatics',
@@ -173,11 +195,13 @@ export async function streamSpeechmaticsTranscription(
   if (supports('maxDelay')) {
     transcriptionConfig.max_delay = providerOptions!.maxDelay;
   }
+  let markEndOfUtterance = false;
   if (supports('endOfUtteranceSilenceTrigger')) {
     transcriptionConfig.conversation_config = {
       end_of_utterance_silence_trigger:
         providerOptions!.endOfUtteranceSilenceTrigger,
     };
+    markEndOfUtterance = providerOptions!.endOfUtteranceSilenceTrigger! > 0;
   }
   for (const key of ['pollingIntervalMs', 'timeoutMs'] as const) {
     if (providerOptions?.[key] != null) {
@@ -191,7 +215,7 @@ export async function streamSpeechmaticsTranscription(
 
   const startRecognition = {
     message: 'StartRecognition',
-    audio_format: { type: 'raw', encoding: format.encoding, sample_rate: rate },
+    audio_format: { type: 'raw', encoding, sample_rate: rate },
     transcription_config: transcriptionConfig,
   };
 
@@ -205,6 +229,13 @@ export async function streamSpeechmaticsTranscription(
     config.realtimeUrl!({ path: agent ? '/v2/agent' : '/v2' }),
   );
   url.searchParams.set('jwt', temporaryKey);
+
+  // Finals are held to be marked with the message that may follow them.
+  const hold = agent
+    ? ({ flag: 'endOfTurn', message: 'EndOfTurn' } as const)
+    : markEndOfUtterance
+      ? ({ flag: 'endOfUtterance', message: 'EndOfUtterance' } as const)
+      : undefined;
 
   const timestamp = config._internal?.currentDate?.() ?? new Date();
   let finished = false;
@@ -224,35 +255,66 @@ export async function streamSpeechmaticsTranscription(
         let wordDelimiter = ' ';
         const results: SpeechmaticsResultItem[] = [];
         const segments: Array<Segment & { speaker?: string }> = [];
-        const serverWarnings: JSONObject[] = [];
-        let pendingSegment:
+        const serverWarnings: NonNullable<
+          SpeechmaticsStreamMetadata['warnings']
+        > = [];
+        // The start time from `StartOfTurn`, until a part of that turn carries it.
+        let turnStart: number | undefined;
+        let pendingFinal:
           | {
-              part: Extract<
-                TranscriptionModelV4StreamPart,
-                { type: 'transcript-final' }
-              >;
+              part: FinalPart;
               timer: ReturnType<typeof setTimeout>;
             }
           | undefined;
 
-        const flushSegment = (endOfTurn: boolean) => {
-          if (pendingSegment == null) return;
-          const { part, timer } = pendingSegment;
-          pendingSegment = undefined;
+        const flushFinal = (value: boolean) => {
+          if (pendingFinal == null || hold == null || finished) return;
+          const { part, timer } = pendingFinal;
+          pendingFinal = undefined;
           clearTimeout(timer);
           controller.enqueue({
             ...part,
             providerMetadata: {
               speechmatics: {
                 ...(part.providerMetadata?.speechmatics ?? {}),
-                endOfTurn,
+                [hold.flag]: value,
               },
             },
           });
         };
 
+        const emitFinal = (part: FinalPart) => {
+          // The stream may have ended while this message was being validated.
+          if (finished) return;
+          if (hold == null) return controller.enqueue(part);
+          flushFinal(false);
+          pendingFinal = {
+            part,
+            timer: setTimeout(() => flushFinal(false), FINAL_HOLD_MS),
+          };
+        };
+
+        // Speaker and turn start metadata for an Agent STT part. A late final
+        // from the previous turn ends before the new turn starts, so it is
+        // not marked.
+        const segmentMetadata = (
+          speaker: string | null | undefined,
+          endSecond: number,
+        ) => {
+          const metadata: SpeechmaticsStreamPartMetadata = {};
+          if (speaker != null) metadata.speaker = speaker;
+          if (turnStart != null && endSecond > turnStart) {
+            metadata.startOfTurn = true;
+            turnStart = undefined;
+          }
+          return Object.keys(metadata).length > 0
+            ? { providerMetadata: { speechmatics: metadata } }
+            : {};
+        };
+
         cleanup = () => {
-          if (pendingSegment != null) clearTimeout(pendingSegment.timer);
+          if (pendingFinal != null) clearTimeout(pendingFinal.timer);
+          pendingFinal = undefined;
           void (
             reader != null ? reader.cancel() : options.audio.cancel()
           ).catch(() => {});
@@ -266,13 +328,13 @@ export async function streamSpeechmaticsTranscription(
         };
         const finish = () => {
           if (finished) return;
-          flushSegment(false);
+          flushFinal(false);
           finished = true;
 
           const durationInSeconds = audioBytes / (rate * format.bytesPerSample);
           let text: string;
           let finalSegments: Segment[];
-          const metadata: JSONObject = {};
+          const metadata: SpeechmaticsStreamMetadata = {};
           if (sessionId != null) metadata.sessionId = sessionId;
 
           if (agent) {
@@ -285,7 +347,8 @@ export async function streamSpeechmaticsTranscription(
               }),
             );
             const utterances = segments.filter(
-              segment => segment.speaker != null,
+              (segment): segment is SpeechmaticsUtterance =>
+                segment.speaker != null,
             );
             if (utterances.length > 0) metadata.utterances = utterances;
           } else {
@@ -328,7 +391,7 @@ export async function streamSpeechmaticsTranscription(
                   ? convertBase64ToUint8Array(value)
                   : value;
               if (bytes.byteLength === 0) continue;
-              socket.send(bytes);
+              socket.send(decode != null ? decode(bytes) : bytes);
               seqNo++;
               audioBytes += bytes.byteLength;
               await waitForWebSocketBufferDrain(socket, {
@@ -368,8 +431,16 @@ export async function streamSpeechmaticsTranscription(
             const type = parsed.value.message;
             const raw = parsed.rawValue;
 
-            // Any message after a held segment shows whether it closed the turn.
-            if (pendingSegment != null) flushSegment(type === 'EndOfTurn');
+            // A held final is settled by the turn or utterance end message, or
+            // by the next non-empty result. Other messages, such as
+            // `AudioAdded`, `SpeechEnded` or the empty partial that comes just
+            // before `EndOfUtterance`, leave it held.
+            if (pendingFinal != null) {
+              if (type === hold?.message) flushFinal(true);
+              else if (TRANSCRIPT_MESSAGES.includes(type) && hasText(raw)) {
+                flushFinal(false);
+              }
+            }
 
             if (options.includeRawChunks) {
               controller.enqueue({ type: 'raw', rawValue: raw });
@@ -411,7 +482,7 @@ export async function streamSpeechmaticsTranscription(
                     durationInSeconds: end_time - start_time,
                   });
                 } else {
-                  controller.enqueue({
+                  emitFinal({
                     type: 'transcript-final',
                     text: transcript.trim(),
                     startSecond: start_time,
@@ -433,17 +504,13 @@ export async function streamSpeechmaticsTranscription(
                 const { start_time, end_time } = event.metadata;
                 const { transcript, speaker } = event.segment;
                 if (transcript.trim().length === 0) break;
-                const speakerMetadata =
-                  speaker != null ? { speechmatics: { speaker } } : undefined;
                 if (type === 'AddPartialSegment') {
                   controller.enqueue({
                     type: 'transcript-partial',
                     text: transcript,
                     startSecond: start_time,
                     durationInSeconds: end_time - start_time,
-                    ...(speakerMetadata != null
-                      ? { providerMetadata: speakerMetadata }
-                      : {}),
+                    ...segmentMetadata(speaker, end_time),
                   });
                 } else {
                   segments.push({
@@ -452,27 +519,31 @@ export async function streamSpeechmaticsTranscription(
                     endSecond: end_time,
                     ...(speaker != null ? { speaker } : {}),
                   });
-                  pendingSegment = {
-                    part: {
-                      type: 'transcript-final',
-                      text: transcript,
-                      startSecond: start_time,
-                      endSecond: end_time,
-                      ...(speakerMetadata != null
-                        ? { providerMetadata: speakerMetadata }
-                        : {}),
-                    },
-                    timer: setTimeout(
-                      () => flushSegment(false),
-                      END_OF_TURN_WAIT_MS,
-                    ),
-                  };
+                  emitFinal({
+                    type: 'transcript-final',
+                    text: transcript,
+                    startSecond: start_time,
+                    endSecond: end_time,
+                    ...segmentMetadata(speaker, end_time),
+                  });
                 }
                 break;
               }
 
+              case 'StartOfTurn': {
+                if (!agent) break;
+                const event = await validateTypes({
+                  value: raw,
+                  schema: startOfTurnSchema,
+                });
+                turnStart = event.metadata?.start_time ?? 0;
+                break;
+              }
+
               case 'Warning':
-                serverWarnings.push(raw as JSONObject);
+                serverWarnings.push(
+                  raw as NonNullable<SpeechmaticsStreamMetadata['warnings']>[number],
+                );
                 break;
 
               case 'Error': {
@@ -492,9 +563,9 @@ export async function streamSpeechmaticsTranscription(
                 finish();
                 break;
 
-              // AudioAdded, Info, LanguageInfo, EndOfUtterance, StartOfTurn,
-              // EndOfTurn, SpeechStarted and SpeechEnded have no stream part.
-              // They are available as raw chunks.
+              // AudioAdded, Info, LanguageInfo, EndOfUtterance, EndOfTurn,
+              // SpeechStarted and SpeechEnded have no stream part of their
+              // own. They are available as raw chunks.
             }
           },
           onSocketError: () =>
@@ -518,7 +589,23 @@ export async function streamSpeechmaticsTranscription(
   };
 }
 
-function toWords(results: SpeechmaticsResultItem[]): JSONObject[] {
+type FinalPart = Extract<
+  TranscriptionModelV4StreamPart,
+  { type: 'transcript-final' }
+>;
+
+// Whether a result message has any text. Read before validation, only to
+// decide whether it settles a held final.
+function hasText(raw: unknown): boolean {
+  const message = raw as {
+    metadata?: { transcript?: unknown };
+    segment?: { transcript?: unknown };
+  };
+  const text = message.metadata?.transcript ?? message.segment?.transcript;
+  return typeof text === 'string' && text.trim().length > 0;
+}
+
+function toWords(results: SpeechmaticsResultItem[]): SpeechmaticsWord[] {
   return results.flatMap(item => {
     const alternative = item.alternatives?.[0];
     if (item.type !== 'word' || alternative == null) return [];
@@ -596,6 +683,14 @@ const segmentSchema = lazySchema(() =>
         transcript: z.string(),
         speaker: z.string().nullish(),
       }),
+    }),
+  ),
+);
+
+const startOfTurnSchema = lazySchema(() =>
+  zodSchema(
+    z.object({
+      metadata: z.object({ start_time: z.number().nullish() }).nullish(),
     }),
   ),
 );

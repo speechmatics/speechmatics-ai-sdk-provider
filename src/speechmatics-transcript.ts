@@ -1,6 +1,11 @@
 // Converts Speechmatics `json-v2` transcript results into plain text, sentence
 // segments, word timings, speaker turns and entities.
 
+import type {
+  SpeechmaticsEntity,
+  SpeechmaticsUtterance,
+} from './speechmatics-provider-metadata';
+
 export type SpeechmaticsResultItem = {
   type: string;
   start_time: number;
@@ -23,9 +28,9 @@ export type SpeechmaticsTranscript = {
   segments: Array<{ text: string } & Timed>;
   words: Array<{ text: string } & Timed>;
   /** Speaker turns. Only present when `includeSpeakers` is set and words carry labels. */
-  utterances?: Array<{ speaker: string; text: string } & Timed>;
+  utterances?: SpeechmaticsUtterance[];
   /** Entity items. Only present when the transcript contains any. */
-  entities?: Array<{ entityClass: string | null; text: string } & Timed>;
+  entities?: SpeechmaticsEntity[];
 };
 
 function createTextBuilder(delimiter: string) {
