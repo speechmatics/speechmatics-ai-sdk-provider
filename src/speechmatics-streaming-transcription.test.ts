@@ -204,6 +204,8 @@ describe('doStream connection', () => {
       'wss://global.rt.speechmatics.com/v2',
     );
     expect(url.searchParams.get('jwt')).toBe('temp-key');
+    // Browsers turn an `undefined` subprotocol into one named "undefined".
+    expect(socket.protocols).toEqual([]);
     expect(socket.options?.headers ?? {}).toEqual({});
     expect(socket.json[0]).toEqual({
       message: 'StartRecognition',
@@ -458,22 +460,6 @@ describe('doStream audio formats', () => {
       'enhanced',
       { type: 'audio/pcm', rate: 8000.5 },
     ],
-    ['24 kHz PCM on linden-1', 'linden-1', { type: 'audio/pcm', rate: 24000 }],
-    [
-      '48 kHz float on linden-1',
-      'linden-1',
-      { type: 'audio/pcm-f32le', rate: 48000 },
-    ],
-    [
-      'mulaw at 11025 Hz on linden-1',
-      'linden-1',
-      { type: 'audio/pcmu', rate: 11025 },
-    ],
-    [
-      'A-law at 24 kHz on linden-1',
-      'linden-1',
-      { type: 'audio/pcma', rate: 24000 },
-    ],
   ] as const)('rejects %s before connecting', async (_, modelId, format) => {
     const server = createFakeServer();
 
@@ -483,15 +469,51 @@ describe('doStream audio formats', () => {
     expect(server.sockets).toHaveLength(0);
   });
 
-  it('names the accepted formats and rates in the linden-1 rate error', async () => {
-    await expect(
-      runStream({
+  it.each([
+    ['audio/pcm', 24000, 2],
+    ['audio/pcm-f32le', 48000, 4],
+    ['audio/pcm-f32le', 44100, 4],
+    ['audio/pcmu', 11025, 1],
+    ['audio/pcma', 24000, 1],
+  ] as const)(
+    'resamples %s at %i Hz to 16 kHz for linden-1',
+    async (type, rate, bytesPerSample) => {
+      // 0.2 s of audio in 3 chunks, the last ending part way through a sample.
+      const bytes = rate * bytesPerSample * 0.2;
+      const { socket, parts } = await runStream({
         modelId: 'linden-1',
-        inputAudioFormat: { type: 'audio/pcma', rate: 24000 },
-      }),
-    ).rejects.toThrow(
-      'linden-1 supports audio/pcm, audio/pcm-f32le, audio/pcmu and audio/pcma at sample rates of 8000 or 16000 Hz. Got 24000.',
-    );
+        inputAudioFormat: { type, rate },
+        chunks: [
+          new Uint8Array(bytesPerSample * 10),
+          new Uint8Array(bytes - bytesPerSample * 10 - 1),
+          new Uint8Array(1),
+        ],
+      });
+
+      expect(socket.json[0].audio_format).toEqual({
+        type: 'raw',
+        encoding: 'pcm_s16le',
+        sample_rate: 16000,
+      });
+      // 0.2 s at 16 kHz is 3200 samples, including the flushed filter tail.
+      expect(socket.audio.reduce((n, c) => n + c.byteLength, 0)).toBe(6400);
+      expect(socket.json.at(-1)).toEqual({
+        message: 'EndOfStream',
+        last_seq_no: socket.audio.length,
+      });
+      expect(finishPart(parts).durationInSeconds).toBeCloseTo(0.2, 6);
+    },
+  );
+
+  it('sends 8 and 16 kHz to linden-1 without resampling', async () => {
+    const chunk = new Uint8Array(new Int16Array([1, -2, 3]).buffer);
+    const { socket } = await runStream({
+      modelId: 'linden-1',
+      inputAudioFormat: { type: 'audio/pcm', rate: 8000 },
+      chunks: [chunk],
+    });
+
+    expect(socket.audio.map(c => [...c])).toEqual([[...chunk]]);
   });
 });
 

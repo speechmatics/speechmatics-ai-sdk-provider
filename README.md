@@ -104,11 +104,11 @@ Audio must be raw, in one of these formats:
 - `audio/pcmu`: G.711 µ-law, as used in telephony.
 - `audio/pcma`: G.711 A-law.
 
-Every model accepts all four. `enhanced`, `standard` and `melia-1` accept any
-sample rate; `linden-1` accepts 8000 or 16000 Hz only. Audio is not resampled,
-so `rate` must be the real sample rate of the audio. Other formats and rates
-throw `InvalidArgumentError` before connecting. Chunks can be `Uint8Array`s or
-base64 strings, of any length.
+Every model accepts all four, at any sample rate. `rate` must be the real sample
+rate of the audio. `linden-1` only takes 8000 or 16000 Hz, so the provider
+resamples other rates to 16000 Hz before sending, which costs about 1 ms of CPU
+per second of audio. Other formats throw `InvalidArgumentError` before
+connecting. Chunks can be `Uint8Array`s or base64 strings, of any length.
 
 Results arrive as `transcript-partial` parts, which later parts may revise, and
 `transcript-final` parts, which are settled. Set `enablePartials: false` to get
@@ -236,9 +236,46 @@ const speechmatics = createSpeechmatics({
 ```
 
 Browsers capture 32-bit float audio, so send it as `audio/pcm-f32le` with the
-`AudioContext`'s `sampleRate`. Firefox can't record at 16000 Hz, and usually
-records at 48000 Hz, which `linden-1` does not accept yet. Use another model in
-Firefox for now.
+`AudioContext`'s `sampleRate`. Firefox can't record at 16000 Hz, so it records
+at the device's rate, usually 48000 Hz.
+
+To stream the microphone, start this from a click:
+
+```ts
+// In the browser, with `speechmatics` from above
+const firefox = navigator.userAgent.includes('Firefox');
+const context = new AudioContext(firefox ? {} : { sampleRate: 16000 });
+const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+const processor = `registerProcessor('mic', class extends AudioWorkletProcessor {
+  process([input]) { if (input[0]) this.port.postMessage(input[0].slice()); return true; }
+});`;
+await context.audioWorklet.addModule(
+  URL.createObjectURL(new Blob([processor], { type: 'text/javascript' })),
+);
+const recorder = new AudioWorkletNode(context, 'mic');
+context.createMediaStreamSource(mic).connect(recorder);
+recorder.connect(context.destination); // Keeps the recorder running.
+
+let stop!: () => void;
+const audio = new ReadableStream<Uint8Array>({
+  start(controller) {
+    recorder.port.onmessage = ({ data }) =>
+      controller.enqueue(new Uint8Array(data.buffer));
+    stop = () => {
+      mic.getTracks().forEach(track => track.stop());
+      void context.close();
+      controller.close();
+    };
+  },
+});
+
+const result = streamTranscribe({
+  model: speechmatics.transcription('enhanced'),
+  audio,
+  inputAudioFormat: { type: 'audio/pcm-f32le', rate: context.sampleRate },
+});
+// Call stop() to end the session; `result.text` then resolves.
+```
 
 ## Models
 

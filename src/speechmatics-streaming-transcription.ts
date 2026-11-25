@@ -25,6 +25,7 @@ import {
 import { z } from 'zod/v4';
 import { decodeFloat32 } from './float32';
 import { decodeAlaw, decodeMulaw } from './g711';
+import { createResampler } from './resample';
 import type { SpeechmaticsConfig } from './speechmatics-config';
 import type {
   SpeechmaticsStreamMetadata,
@@ -132,16 +133,16 @@ export async function streamSpeechmaticsTranscription(
         'Speechmatics streaming requires a positive integer sample rate.',
     });
   }
-  if (agent && !AGENT_SAMPLE_RATES.includes(rate)) {
-    throw new InvalidArgumentError({
-      argument: 'inputAudioFormat',
-      message: `${modelId} supports audio/pcm, audio/pcm-f32le, audio/pcmu and audio/pcma at sample rates of ${AGENT_SAMPLE_RATES.join(' or ')} Hz. Got ${rate}.`,
-    });
-  }
   const sendsNative =
     format.encoding === 'pcm_s16le' || (!agent && format.encoding != null);
   const encoding = sendsNative ? format.encoding! : 'pcm_s16le';
   const decode = sendsNative ? undefined : format.decode!;
+  // Agent STT accepts 8 or 16 kHz only, so other rates are resampled to 16 kHz.
+  const resampler =
+    agent && !AGENT_SAMPLE_RATES.includes(rate)
+      ? createResampler(rate, 16000)
+      : undefined;
+  const sentRate = resampler != null ? 16000 : rate;
 
   const providerOptions = await parseProviderOptions({
     provider: 'speechmatics',
@@ -221,7 +222,7 @@ export async function streamSpeechmaticsTranscription(
 
   const startRecognition = {
     message: 'StartRecognition',
-    audio_format: { type: 'raw', encoding, sample_rate: rate },
+    audio_format: { type: 'raw', encoding, sample_rate: sentRate },
     transcription_config: transcriptionConfig,
   };
 
@@ -412,9 +413,12 @@ export async function streamSpeechmaticsTranscription(
               partial = bytes.slice(whole);
               bytes = bytes.subarray(0, whole);
               if (bytes.byteLength === 0) continue;
-              socket.send(decode != null ? decode(bytes) : bytes);
-              seqNo++;
               audioBytes += bytes.byteLength;
+              let pcm = decode != null ? decode(bytes) : bytes;
+              if (resampler != null) pcm = resampler.process(pcm);
+              if (pcm.byteLength === 0) continue;
+              socket.send(pcm);
+              seqNo++;
               await waitForWebSocketBufferDrain(socket, {
                 abortSignal: options.abortSignal,
               });
@@ -422,6 +426,13 @@ export async function streamSpeechmaticsTranscription(
           } finally {
             reader.releaseLock();
             reader = undefined;
+          }
+          if (!finished && resampler != null) {
+            const tail = resampler.flush();
+            if (tail.byteLength > 0) {
+              socket.send(tail);
+              seqNo++;
+            }
           }
           if (!finished) {
             socket.send(
@@ -432,6 +443,9 @@ export async function streamSpeechmaticsTranscription(
 
         connection = connectToWebSocket({
           url,
+          // Without this, browsers send a subprotocol named "undefined", which
+          // Speechmatics doesn't echo back, so the browser drops the connection.
+          protocols: [],
           webSocket: config.webSocket,
           abortSignal: options.abortSignal,
           onAbort: fail,
