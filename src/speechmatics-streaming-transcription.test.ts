@@ -325,6 +325,9 @@ describe('doStream audio formats', () => {
   it.each([
     ['audio/pcm', 'enhanced', 16000, 'pcm_s16le'],
     ['audio/pcm', 'linden-1', 8000, 'pcm_s16le'],
+    ['audio/pcm-f32le', 'enhanced', 48000, 'pcm_f32le'],
+    ['audio/pcm-f32le', 'melia-1', 16000, 'pcm_f32le'],
+    ['audio/pcm-f32le', 'linden-1', 16000, 'pcm_s16le'],
     ['audio/pcmu', 'enhanced', 8000, 'mulaw'],
     ['audio/pcmu', 'standard', 8000, 'mulaw'],
     ['audio/pcmu', 'melia-1', 8000, 'mulaw'],
@@ -379,6 +382,42 @@ describe('doStream audio formats', () => {
     expect(finishPart(parts).durationInSeconds).toBe(0.1);
   });
 
+  it('sends 32-bit float bytes unchanged to the Realtime API, in whole samples', async () => {
+    const floats = new Uint8Array(new Float32Array([0.5, -1]).buffer);
+    const { socket, parts } = await runStream({
+      inputAudioFormat: { type: 'audio/pcm-f32le', rate: 16000 },
+      chunks: [
+        floats.subarray(0, 2),
+        floats.subarray(2, 6),
+        floats.subarray(6),
+        new Uint8Array(6392),
+      ],
+    });
+
+    expect(socket.audio.slice(0, 2).map(chunk => [...chunk])).toEqual([
+      [...floats.subarray(0, 4)],
+      [...floats.subarray(4)],
+    ]);
+    // 6400 bytes of 16 kHz 32-bit float is 0.1 s.
+    expect(finishPart(parts).durationInSeconds).toBe(0.1);
+  });
+
+  it('converts 32-bit float to 16-bit PCM for linden-1, across chunks', async () => {
+    const floats = new Uint8Array(new Float32Array([1, -1, 0.5]).buffer);
+    const { socket, parts } = await runStream({
+      modelId: 'linden-1',
+      inputAudioFormat: { type: 'audio/pcm-f32le', rate: 16000 },
+      chunks: [floats.subarray(0, 6), floats.subarray(6), new Uint8Array(6388)],
+    });
+
+    expect(socket.audio.map(int16).slice(0, 2)).toEqual([
+      [32767],
+      [-32768, 16384],
+    ]);
+    expect(socket.audio.reduce((n, c) => n + c.byteLength, 0)).toBe(3200);
+    expect(finishPart(parts).durationInSeconds).toBe(0.1);
+  });
+
   it.each(['enhanced', 'linden-1'] as const)(
     'decodes A-law to 16-bit PCM for %s',
     async modelId => {
@@ -421,6 +460,11 @@ describe('doStream audio formats', () => {
     ],
     ['24 kHz PCM on linden-1', 'linden-1', { type: 'audio/pcm', rate: 24000 }],
     [
+      '48 kHz float on linden-1',
+      'linden-1',
+      { type: 'audio/pcm-f32le', rate: 48000 },
+    ],
+    [
       'mulaw at 11025 Hz on linden-1',
       'linden-1',
       { type: 'audio/pcmu', rate: 11025 },
@@ -446,7 +490,7 @@ describe('doStream audio formats', () => {
         inputAudioFormat: { type: 'audio/pcma', rate: 24000 },
       }),
     ).rejects.toThrow(
-      'linden-1 supports audio/pcm, audio/pcmu and audio/pcma at sample rates of 8000 or 16000 Hz. Got 24000.',
+      'linden-1 supports audio/pcm, audio/pcm-f32le, audio/pcmu and audio/pcma at sample rates of 8000 or 16000 Hz. Got 24000.',
     );
   });
 });

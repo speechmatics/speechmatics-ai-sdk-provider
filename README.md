@@ -100,14 +100,15 @@ console.log(await result.text);
 Audio must be raw, in one of these formats:
 
 - `audio/pcm`: 16-bit little-endian PCM.
+- `audio/pcm-f32le`: 32-bit float little-endian PCM, as browsers capture it.
 - `audio/pcmu`: G.711 µ-law, as used in telephony.
 - `audio/pcma`: G.711 A-law.
 
-Every model accepts all three. `enhanced`, `standard` and `melia-1` accept any
+Every model accepts all four. `enhanced`, `standard` and `melia-1` accept any
 sample rate; `linden-1` accepts 8000 or 16000 Hz only. Audio is not resampled,
 so `rate` must be the real sample rate of the audio. Other formats and rates
 throw `InvalidArgumentError` before connecting. Chunks can be `Uint8Array`s or
-base64 strings.
+base64 strings, of any length.
 
 Results arrive as `transcript-partial` parts, which later parts may revise, and
 `transcript-final` parts, which are settled. Set `enablePartials: false` to get
@@ -233,6 +234,11 @@ const speechmatics = createSpeechmatics({
   },
 });
 ```
+
+Browsers capture 32-bit float audio, so send it as `audio/pcm-f32le` with the
+`AudioContext`'s `sampleRate`. Firefox can't record at 16000 Hz, and usually
+records at 48000 Hz, which `linden-1` does not accept yet. Use another model in
+Firefox for now.
 
 ## Models
 

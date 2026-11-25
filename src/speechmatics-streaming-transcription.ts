@@ -23,6 +23,7 @@ import {
   type WebSocketLike,
 } from '@ai-sdk/provider-utils';
 import { z } from 'zod/v4';
+import { decodeFloat32 } from './float32';
 import { decodeAlaw, decodeMulaw } from './g711';
 import type { SpeechmaticsConfig } from './speechmatics-config';
 import type {
@@ -85,11 +86,16 @@ const INPUT_FORMATS: Record<
   string,
   {
     bytesPerSample: number;
-    encoding?: 'pcm_s16le' | 'mulaw';
+    encoding?: 'pcm_s16le' | 'pcm_f32le' | 'mulaw';
     decode?: (bytes: Uint8Array) => Uint8Array;
   }
 > = {
   'audio/pcm': { bytesPerSample: 2, encoding: 'pcm_s16le' },
+  'audio/pcm-f32le': {
+    bytesPerSample: 4,
+    encoding: 'pcm_f32le',
+    decode: decodeFloat32,
+  },
   'audio/pcmu': { bytesPerSample: 1, encoding: 'mulaw', decode: decodeMulaw },
   'audio/pcma': { bytesPerSample: 1, decode: decodeAlaw },
 };
@@ -116,7 +122,7 @@ export async function streamSpeechmaticsTranscription(
   if (format == null) {
     throw new InvalidArgumentError({
       argument: 'inputAudioFormat',
-      message: `Speechmatics streaming supports audio/pcm (16-bit little-endian), audio/pcmu and audio/pcma. Got ${options.inputAudioFormat.type}.`,
+      message: `Speechmatics streaming supports audio/pcm (16-bit little-endian), audio/pcm-f32le (32-bit float little-endian), audio/pcmu and audio/pcma. Got ${options.inputAudioFormat.type}.`,
     });
   }
   if (rate == null || !Number.isInteger(rate) || rate <= 0) {
@@ -129,7 +135,7 @@ export async function streamSpeechmaticsTranscription(
   if (agent && !AGENT_SAMPLE_RATES.includes(rate)) {
     throw new InvalidArgumentError({
       argument: 'inputAudioFormat',
-      message: `${modelId} supports audio/pcm, audio/pcmu and audio/pcma at sample rates of ${AGENT_SAMPLE_RATES.join(' or ')} Hz. Got ${rate}.`,
+      message: `${modelId} supports audio/pcm, audio/pcm-f32le, audio/pcmu and audio/pcma at sample rates of ${AGENT_SAMPLE_RATES.join(' or ')} Hz. Got ${rate}.`,
     });
   }
   const sendsNative =
@@ -381,15 +387,30 @@ export async function streamSpeechmaticsTranscription(
 
         const sendAudio = async (socket: WebSocketLike) => {
           reader = options.audio.getReader();
+          // The Realtime API rejects 32-bit float chunks that split a sample,
+          // so a partial sample at the end of a chunk waits for the next one.
+          let partial = new Uint8Array(0);
           try {
             while (true) {
               if (finished) break;
               const { done, value } = await reader.read();
               if (done || finished) break;
-              const bytes =
+              let bytes =
                 typeof value === 'string'
                   ? convertBase64ToUint8Array(value)
                   : value;
+              if (partial.byteLength > 0) {
+                const joined = new Uint8Array(
+                  partial.byteLength + bytes.byteLength,
+                );
+                joined.set(partial);
+                joined.set(bytes, partial.byteLength);
+                bytes = joined;
+              }
+              const whole =
+                bytes.byteLength - (bytes.byteLength % format.bytesPerSample);
+              partial = bytes.slice(whole);
+              bytes = bytes.subarray(0, whole);
               if (bytes.byteLength === 0) continue;
               socket.send(decode != null ? decode(bytes) : bytes);
               seqNo++;
