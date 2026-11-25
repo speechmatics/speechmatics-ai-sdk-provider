@@ -5,7 +5,9 @@
 
 > **Beta.** Batch and streaming transcription are available. Streaming uses the
 > AI SDK's `experimental_streamTranscribe`, which may change in patch releases
-> of the AI SDK.
+> of the AI SDK. Feedback is welcome in
+> [GitHub issues](https://github.com/speechmatics/speechmatics-ai-sdk-provider/issues)
+> or on [Discord](https://discord.com/invite/speechmatics).
 
 ## Installation
 
@@ -374,6 +376,15 @@ SPEECHMATICS_API_KEY=... node examples/stream-transcribe.mjs call.wav linden-1
   [Agent STT overview](https://docs.speechmatics.com/speech-to-text/agent-stt/).
 - [Batch API](https://docs.speechmatics.com/api-ref/batch/create-a-new-job),
   used by `transcribe`.
+
+## Feedback and support
+
+This package is in beta, and feedback shapes the 1.0 release.
+
+- Bugs and feature requests:
+  [GitHub issues](https://github.com/speechmatics/speechmatics-ai-sdk-provider/issues)
+- Questions and discussion: the
+  [Speechmatics Discord](https://discord.com/invite/speechmatics)
 
 ## Licence
 
