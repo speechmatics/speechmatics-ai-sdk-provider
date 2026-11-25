@@ -1,6 +1,6 @@
 {
   "name": "@speechmatics/ai-sdk-provider",
-  "version": "0.2.0-beta.2",
+  "version": "0.2.0-beta.3",
   "description": "Speechmatics speech-to-text provider for the Vercel AI SDK",
   "license": "MIT",
   "type": "module",
