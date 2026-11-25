@@ -30,8 +30,8 @@ jobs:
             exit 1
           fi
 
-      # A version like 0.1.0-beta.1 publishes under the `beta` dist-tag so it
-      # never becomes `latest`. A plain version like 0.1.0 publishes as `latest`.
+      # A version like 0.1.0-beta.1 publishes under the `beta` dist-tag, and a
+      # plain version like 0.1.0 publishes as `latest`.
       - name: Pick the dist-tag
         id: dist-tag
         run: |
@@ -43,7 +43,16 @@ jobs:
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "Publishing ${version} with dist-tag ${tag}"
 
+      # Moving a dist-tag with trusted publishing needs npm 11.21 or later.
+      - run: npm install -g npm@11.21.3
+
       - run: npm ci
 
       # `prepublishOnly` runs the type-check, tests and build.
       - run: npm publish --tag "${{ steps.dist-tag.outputs.tag }}"
+
+      # Until 1.0 every release is a beta, so each one also becomes `latest`.
+      # This needs "Allow npm dist-tag" on the package's trusted publisher.
+      - name: Point latest at the beta
+        if: startsWith(github.ref_name, 'v0.') && steps.dist-tag.outputs.tag == 'beta'
+        run: npm dist-tag add "$(node -p "require('./package.json').name")@${GITHUB_REF_NAME#v}" latest
